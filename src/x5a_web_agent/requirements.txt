@@ -4,3 +4,4 @@ websockets>=9.1
 python-multipart>=0.0.5
 numpy>=1.21,<2
 faster-whisper>=1.0.0
+paho-mqtt>=1.5

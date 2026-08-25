@@ -13,7 +13,7 @@ setup(
         ("share/" + package_name + "/static", glob("static/*")),
         ("share/" + package_name + "/certs", glob("certs/*")),
     ],
-    install_requires=["setuptools", "fastapi", "uvicorn"],
+    install_requires=["setuptools", "fastapi", "uvicorn", "paho-mqtt>=1.5"],
     zip_safe=True,
     maintainer="x5a user",
     maintainer_email="user@example.com",

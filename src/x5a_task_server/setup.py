@@ -11,7 +11,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", glob("launch/*.py")),
     ],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "paho-mqtt>=1.5"],
     zip_safe=True,
     maintainer="x5a user",
     maintainer_email="user@example.com",

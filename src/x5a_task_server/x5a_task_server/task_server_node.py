@@ -12,6 +12,7 @@ from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import Bool, String
 from x5a_pick_place.pick_place_node import ALLOWED_TARGETS, PickPlaceNode
 from x5a_task_interfaces.action import X5aPickPlace
+from x5a_task_server.mqtt_link import publish_task_finished
 
 TERMINAL_STAGES = frozenset({"SUCCESS", "FAILED"})
 
@@ -21,6 +22,9 @@ class X5aTaskServer(PickPlaceNode):
         super().__init__(node_name="x5a_task_server")
         self._busy = False
         self._busy_lock = threading.Lock()
+        self._mqtt_lock = threading.Lock()
+        self._mqtt_completion_pending = False
+        self._mqtt_defer_success = False
         self._last_stage = "IDLE"
         self._action_cb = ReentrantCallbackGroup()
         self.set_stage_callback(self._on_stage)
@@ -47,6 +51,14 @@ class X5aTaskServer(PickPlaceNode):
             self._busy = False
         self._publish_stage(stage)
         self._publish_busy(False)
+        if stage in TERMINAL_STAGES:
+            with self._mqtt_lock:
+                pending = self._mqtt_completion_pending
+                defer_success = self._mqtt_defer_success
+                self._mqtt_completion_pending = False
+                self._mqtt_defer_success = False
+            if pending and not (stage == "SUCCESS" and defer_success):
+                publish_task_finished(self.get_logger())
         self.get_logger().info(f"X5A TASK SERVER: IDLE ({stage})")
 
     def goal_callback(self, goal_request: X5aPickPlace.Goal) -> GoalResponse:
@@ -61,6 +73,9 @@ class X5aTaskServer(PickPlaceNode):
                 )
                 return GoalResponse.REJECT
             self._busy = True
+        with self._mqtt_lock:
+            self._mqtt_completion_pending = True
+            self._mqtt_defer_success = bool(goal_request.skip_return_home)
         self._publish_busy(True)
         return GoalResponse.ACCEPT
 

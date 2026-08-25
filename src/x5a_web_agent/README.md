@@ -42,6 +42,58 @@ source install/setup.bash
 
 完整启动、测试和排错见仓库根目录 [docs/VOICE_INTERACTION.md](../../docs/VOICE_INTERACTION.md)。
 
+## 把识别原文发到远程服务器
+
+语音识别成功后，主机按照《交互式机械臂联调接口表 V1.3》只发送最终中文原文，不发送音频、解析结果或 partial/interim 文本：
+
+```http
+POST http://118.253.179.80:8210/api/v1/interaction/text
+Content-Type: application/json; charset=utf-8
+
+{"text":"机械臂向右移动一点"}
+```
+
+默认使用 8210 端口。可通过环境变量改目标地址：
+
+```bash
+export X5A_TEXT_FORWARD_URL=http://118.253.179.80:8210/api/v1/interaction/text
+```
+
+数字人正常受理返回 HTTP 200；参数错误返回 400；已有联动任务返回 409。关掉转发：
+
+```bash
+export X5A_TEXT_FORWARD=0
+```
+
+联动握手（文字 / 语音指令，不含网页颜色按钮和 `--dry-run`）：
+
+1. 主机 POST 最终中文原文，必须收到 HTTP 200。
+2. 数字人先播报「正在执行中」。
+3. **只有这段前置播报真正播放完成后**，数字人才向 MQTT 发布开始标志，并把本地 `waiting_finish` 置为 true：
+
+```text
+Topic: robot_arm/task_busy
+Payload: true
+QoS: 1
+Retain: false
+```
+
+4. 主机收到字符串 `true` 后才发 ROS Action，机械臂开始动。
+5. 任务完成、失败或取消后，Task Server 发布结束标志：
+
+```text
+Topic: robot_arm/task_busy
+Payload: false
+QoS: 1
+Retain: false
+```
+
+连续任务只在最后一个动作完成后发布 `false`；若中途失败则立即发布。默认最多等开始标志 30 秒。可通过
+`X5A_MQTT_HOST`、`X5A_MQTT_PORT`、`X5A_MQTT_TOPIC`、
+`X5A_MQTT_USERNAME`、`X5A_MQTT_PASSWORD` 修改连接参数，
+`X5A_MQTT_START_TIMEOUT` 修改等待秒数，或设置
+`X5A_MQTT_ENABLED=0` / `X5A_MQTT_WAIT_START=0` 关闭。
+
 ## 接到 QQ 群机器人
 
 网页麦克风经常被 QQ/微信内置浏览器拦住。更稳的方式是：群里发「抓红色」或发一条语音，机器人回群并调用现有抓取链。

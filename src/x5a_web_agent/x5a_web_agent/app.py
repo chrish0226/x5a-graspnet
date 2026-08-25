@@ -27,7 +27,20 @@ from x5a_web_agent.command_parser import (
     sanitize_task,
 )
 from x5a_web_agent.qq_bot import extract_group_command, fetch_record_wav, send_group_msg
+from x5a_web_agent.mqtt_start import (
+    cancel_wait as cancel_mqtt_start_wait,
+    host_port_topic as mqtt_host_port_topic,
+    prepare_for_start,
+    start_listener as start_mqtt_listener,
+    start_timeout as mqtt_start_timeout,
+    stop_listener as stop_mqtt_listener,
+    wait_for_true as wait_mqtt_true,
+    wait_start_enabled,
+    wait_was_cancelled,
+)
 from x5a_web_agent.ros_bridge import BUSY_MESSAGE, RosBridge
+from x5a_web_agent.text_forward import enabled as text_forward_enabled
+from x5a_web_agent.text_forward import forward_text, forward_url
 
 COLOR_ZH = {
     "red": "红色",
@@ -57,6 +70,7 @@ STAGE_ZH = {
     "IDLE": "空闲，等待指令",
     "DRY_RUN": "演练模式：未发送运动指令",
     "ACCEPTED": "任务已接受",
+    "WAITING_START": "等待数字人播报完成",
     "SELECT_BY_BOX": "正在比较与盒子的距离",
 }
 
@@ -176,6 +190,7 @@ async def _startup() -> None:
         print(f"[x5a_web_agent] ROS bridge start failed: {exc}")
     if bridge is not None:
         hub.state["server_ready"] = bool(bridge.server_ready(0.2))
+    start_mqtt_listener()
     if isinstance(asr_backend, WhisperSpeechToText):
         def _preload() -> None:
             try:
@@ -191,7 +206,8 @@ async def _startup() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    return
+    cancel_mqtt_start_wait()
+    stop_mqtt_listener()
 
 
 @app.get("/")
@@ -281,7 +297,11 @@ async def api_onebot(request: Request) -> Dict[str, Any]:
 
 @app.post("/api/cancel")
 async def api_cancel() -> Dict[str, Any]:
+    waiting = str(hub.state.get("stage") or "") == "WAITING_START"
+    cancel_mqtt_start_wait()
     ok = _bridge().cancel()
+    if waiting:
+        return {"ok": True, "message": "已取消等待数字人开始标志"}
     return {"ok": ok, "message": "已请求停止当前任务" if ok else "当前没有可取消的任务"}
 
 
@@ -304,13 +324,14 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     }
                 )
             elif msg_type == "cancel":
+                waiting = str(hub.state.get("stage") or "") == "WAITING_START"
+                cancel_mqtt_start_wait()
                 ok = _bridge().cancel()
-                await hub.broadcast(
-                    {
-                        "type": "info",
-                        "message": "已请求停止当前任务" if ok else "当前没有可取消的任务",
-                    }
-                )
+                if waiting:
+                    message = "已取消等待数字人开始标志"
+                else:
+                    message = "已请求停止当前任务" if ok else "当前没有可取消的任务"
+                await hub.broadcast({"type": "info", "message": message})
             else:
                 await ws.send_json({"type": "error", "message": f"未知消息类型: {msg_type}"})
     except WebSocketDisconnect:
@@ -326,7 +347,7 @@ async def handle_text_command(text: str) -> Dict[str, Any]:
     parsed = parser.parse_command(transcript)
     await hub.update(parsed=parsed)
     await hub.broadcast({"type": "parsed", "result": parsed})
-    return await dispatch_parsed(parsed)
+    return await dispatch_parsed(parsed, source_text=transcript)
 
 
 async def handle_structured_task(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -339,7 +360,79 @@ async def handle_structured_task(task: Dict[str, Any]) -> Dict[str, Any]:
     return await dispatch_parsed(parsed)
 
 
-async def dispatch_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
+def _needs_digital_human_handshake(source_text: str) -> bool:
+    if not (source_text or "").strip():
+        return False
+    if bridge is not None and bridge.dry_run:
+        return False
+    return bool(text_forward_enabled())
+
+
+async def _handshake_or_error(source_text: str) -> Optional[Dict[str, Any]]:
+    """HTTP text then wait for MQTT true. None means the arm may start."""
+    if not _needs_digital_human_handshake(source_text):
+        return None
+    prepare_for_start()
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, lambda: forward_text(source_text))
+    if not result.ok:
+        return {
+            "ok": False,
+            "type": "error",
+            "message": result.error or "数字人 HTTP 转发失败",
+            "stage": "FAILED",
+        }
+    if not wait_start_enabled():
+        return None
+    await hub.update(robot_state="BUSY", busy=True, stage="WAITING_START")
+    await hub.broadcast(
+        {
+            "type": "info",
+            "message": "已通知数字人，等待播报「正在执行中」完成后开始",
+            "stage": "WAITING_START",
+            "stage_zh": STAGE_ZH["WAITING_START"],
+        }
+    )
+    got_true = await loop.run_in_executor(None, wait_mqtt_true)
+    if got_true:
+        return None
+    if wait_was_cancelled():
+        return {
+            "ok": False,
+            "type": "error",
+            "message": "已取消等待数字人开始标志",
+            "stage": "FAILED",
+        }
+    return {
+        "ok": False,
+        "type": "error",
+        "message": "等待数字人开始标志超时（未收到 MQTT true）",
+        "stage": "FAILED",
+    }
+
+
+async def _fail_before_motion(payload: Dict[str, Any], parsed: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(payload)
+    payload["parsed"] = parsed
+    await hub.update(
+        robot_state="IDLE",
+        busy=False,
+        stage="FAILED",
+        last_result={
+            "success": False,
+            "message": payload.get("message"),
+            "stage": "FAILED",
+        },
+        queue_active=False,
+    )
+    await hub.broadcast(payload)
+    return payload
+
+
+async def dispatch_parsed(
+    parsed: Dict[str, Any],
+    source_text: str = "",
+) -> Dict[str, Any]:
     action = parsed.get("action")
     if action == "unknown":
         payload = {
@@ -351,11 +444,18 @@ async def dispatch_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
         await hub.broadcast(payload)
         return payload
     if action == "cancel":
+        waiting = str(hub.state.get("stage") or "") == "WAITING_START"
+        cancel_mqtt_start_wait()
         ok = _bridge().cancel()
+        if waiting:
+            message = "已取消等待数字人开始标志"
+            ok = True
+        else:
+            message = "已请求停止当前任务" if ok else "当前没有可取消的任务"
         payload = {
             "ok": ok,
             "type": "info",
-            "message": "已请求停止当前任务" if ok else "当前没有可取消的任务",
+            "message": message,
             "parsed": parsed,
         }
         await hub.broadcast(payload)
@@ -380,8 +480,12 @@ async def dispatch_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
             }
             await hub.broadcast(payload)
             return payload
-        await hub.update(robot_state="BUSY", busy=True, stage="ACCEPTED", queue_active=True)
-        asyncio.create_task(_run_task_queue(tasks, parsed))
+        handshake = _needs_digital_human_handshake(source_text)
+        stage = "WAITING_START" if handshake else "ACCEPTED"
+        await hub.update(
+            robot_state="BUSY", busy=True, stage=stage, queue_active=True
+        )
+        asyncio.create_task(_run_linked_task_queue(tasks, parsed, source_text))
         names = "、".join(
             COLOR_ZH.get(str(item.get("target_color")), str(item.get("target_color")))
             for item in tasks
@@ -389,10 +493,14 @@ async def dispatch_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
         payload = {
             "ok": True,
             "type": "info",
-            "message": f"已加入{len(tasks)}个任务：{names}",
+            "message": (
+                f"等待数字人播报完成后开始：{names}"
+                if handshake
+                else f"已加入{len(tasks)}个任务：{names}"
+            ),
             "parsed": parsed,
-            "stage": "ACCEPTED",
-            "stage_zh": STAGE_ZH["ACCEPTED"],
+            "stage": stage,
+            "stage_zh": STAGE_ZH[stage],
         }
         await hub.broadcast(payload)
         return payload
@@ -427,21 +535,66 @@ async def dispatch_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
         await hub.broadcast(payload)
         return payload
 
-    await hub.update(robot_state="BUSY", busy=True, stage="ACCEPTED")
-    asyncio.create_task(_run_pick_place(str(color), parsed, on_done=None))
+    handshake = _needs_digital_human_handshake(source_text)
+    stage = "WAITING_START" if handshake else "ACCEPTED"
+    await hub.update(robot_state="BUSY", busy=True, stage=stage)
+    asyncio.create_task(_run_linked_pick_place(str(color), parsed, source_text))
     payload = {
         "ok": True,
         "type": "info",
-        "message": "任务已提交",
+        "message": "等待数字人播报完成后开始" if handshake else "任务已提交",
         "parsed": parsed,
-        "stage": "ACCEPTED",
-        "stage_zh": STAGE_ZH["ACCEPTED"],
+        "stage": stage,
+        "stage_zh": STAGE_ZH[stage],
     }
     await hub.broadcast(payload)
     return payload
 
 
+async def _announce_motion_start() -> None:
+    await hub.update(robot_state="BUSY", busy=True, stage="ACCEPTED")
+    await hub.broadcast(
+        {
+            "type": "info",
+            "message": "数字人开始标志已收到，开始执行",
+            "stage": "ACCEPTED",
+            "stage_zh": STAGE_ZH["ACCEPTED"],
+        }
+    )
+
+
+async def _run_linked_pick_place(
+    color: str,
+    parsed: Dict[str, Any],
+    source_text: str,
+) -> None:
+    err = await _handshake_or_error(source_text)
+    if err:
+        await _fail_before_motion(err, parsed)
+        return
+    if _needs_digital_human_handshake(source_text):
+        await _announce_motion_start()
+    await _run_pick_place(color, parsed, on_done=None)
+
+
+async def _run_linked_task_queue(
+    tasks: List[Dict[str, Any]],
+    parsed: Dict[str, Any],
+    source_text: str,
+) -> None:
+    err = await _handshake_or_error(source_text)
+    if err:
+        await _fail_before_motion(err, parsed)
+        return
+    if _needs_digital_human_handshake(source_text):
+        await _announce_motion_start()
+        await hub.update(queue_active=True)
+    await _run_task_queue(tasks, parsed)
+
+
 async def _apply_stage(stage: str) -> None:
+    if str(hub.state.get("stage") or "") == "WAITING_START":
+        return
     terminal = stage in TERMINAL_STAGES
     await hub.update(
         robot_state="IDLE" if terminal else "BUSY",
@@ -605,7 +758,7 @@ async def _handle_qq_event(event: Dict[str, Any]) -> None:
             send_group_msg(group_id, f"收到，将依次抓取：{names}")
         elif parsed.get("action") == "cancel":
             send_group_msg(group_id, "收到停止请求")
-        payload = await dispatch_parsed(parsed)
+        payload = await dispatch_parsed(parsed, source_text=text)
         if payload.get("type") == "info" and payload.get("stage") == "ACCEPTED":
             asyncio.create_task(_watch_and_reply_qq(group_id, payload))
         elif payload.get("message"):
@@ -755,6 +908,12 @@ def main(args: Optional[List[str]] = None) -> None:
     print(f"page:   http://{ip}:{parsed.port}")
     print(f"local:  http://127.0.0.1:{parsed.port}")
     print(f"ASR:    {asr_backend.name} (local faster-whisper small)")
+    print(f"text->: {forward_url()}")
+    mqtt_host, mqtt_port, mqtt_topic = mqtt_host_port_topic()
+    print(
+        f"mqtt:   {mqtt_host}:{mqtt_port} {mqtt_topic} "
+        f"wait_start={int(wait_start_enabled())} timeout={mqtt_start_timeout():.0f}s"
+    )
     print(f"dry_run:{os.environ.get('X5A_WEB_DRY_RUN', '0')}")
 
     import threading

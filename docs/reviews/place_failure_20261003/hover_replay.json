@@ -1,0 +1,49 @@
+{
+  "capture": "/home/quella/.local/share/x5a_remote_grasp/captures/20261003_183648_427351",
+  "elapsed_s": 0.844,
+  "selected": true,
+  "attempts": 3,
+  "release_clearances_m": [
+    0.01,
+    0.015,
+    0.018,
+    0.02
+  ],
+  "scene_changes_sent": 0,
+  "controller_actions_sent": 0,
+  "tool0": [
+    [
+      0.32065937165634195,
+      -0.8600732234237477,
+      0.39680173603254815,
+      0.1689771633700825
+    ],
+    [
+      0.5338372621873512,
+      0.5101515247356249,
+      0.6743613269681399,
+      0.2796934396131255
+    ],
+    [
+      -0.7824291308925513,
+      -0.004412726980137227,
+      0.6227240022444338,
+      0.11793359170444088
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "stages": [
+    "TRANSPORT",
+    "PLACE",
+    "RETREAT"
+  ],
+  "bottom_clearance_m": 0.015,
+  "object_xy_error_m": 5.551115123125783e-17,
+  "held_geometry_preserved": true,
+  "still_holding": true
+}

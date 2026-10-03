@@ -26,6 +26,23 @@ __pycache__/
 *.log
 *.pid
 
+# Local credentials and private keys
+.env
+.env.*
+!.env.example
+!*.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Downloaded model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+
 # ROS bags
 rosbag2_*/
 *.db3

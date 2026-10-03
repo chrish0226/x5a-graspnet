@@ -89,7 +89,8 @@ sample() {
 
 solve() {
   echo "=== OpenCV standard eye-to-hand solve ==="
-  python3 -m x5a_handeye.solve_handeye \
+  # /usr/bin/python3 has cv2; conda base python3 does not
+  /usr/bin/python3 -m x5a_handeye.solve_handeye \
     --samples "$SAMPLES" \
     --output "$RESULT" \
     --max-reject 5 \

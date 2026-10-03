@@ -17,6 +17,24 @@
 
 完整说明：[docs/VOICE_INTERACTION.md](docs/VOICE_INTERACTION.md)。
 
+### 终端文字输入层（测试用，不用麦克风）
+
+不想说话/没有手机时，直接用键盘打字，走的是和语音完全相同的那条链路（只替换「语音转文字」这一步）：
+
+```bash
+./scripts/text_cli.sh                      # 接入已经在跑的 web_agent（默认 127.0.0.1:8000）
+./scripts/text_cli.sh --url http://192.168.0.50:8000
+
+# 或者把输入层塞进 web_agent 进程本身（要先停掉已有的 web_agent）
+ros2 run x5a_web_agent web_agent --host 0.0.0.0 --port 8000 --terminal
+./run_x5a_voice_demo.sh --terminal
+```
+
+新开的终端一定要先 source 环境（或直接用 `scripts/text_cli.sh`，它自己会 source）：
+`source /opt/ros/humble/setup.bash && source ~/arx/arm/install/setup.bash`，否则会报 `Package 'x5a_web_agent' not found`。
+
+`/help` 看命令（`/state`、`/cancel`、`/task red`、`/parse <文字>`、`/quit`）。真机模式下打进去的文字会真的动机械臂；只想看解析就用层里的 `/parse`。
+
 ## 一键视觉抓取
 
 机械臂、RealSense、CANable2 正确连接后：
@@ -131,6 +149,7 @@ X5A -> CAN -> X5Controller -> /arm_status (RobotStatus)
 | `x5a_task_server` | 长期运行的 `/x5a/pick_place` Action，复用 `x5a_pick_place` |
 | `x5a_web_agent` | 手机网页、语音文字、规则解析、Action Client |
 | `x5a_vision` | HSV + RGB-D + TF2 的红/白/橙方块及黑色海绵中心定位 |
+| `x5a_remote_grasp` | 远程 SAM 3.1 + GraspNet 候选、TF/RViz/IK/MoveIt 纯规划 |
 | `x5a_handeye` | ChArUco 检测、采样、Eye-to-Hand 求解、验证与 TF 发布 |
 | `x5a_mtc_pick_place` | 实验性 MTC 整链规划；日常抓取不要用 |
 | `x5a_task_interfaces` | MTC 的 `PickPlace` 以及语音链路的 `X5aPickPlace` action |

@@ -1,0 +1,130 @@
+calibration_type: eye_to_hand
+method_convention: opencv_calibrateHandEye_eye_to_hand
+parent_frame: base_link
+camera_frame: camera_color_optical_frame
+camera_root_frame: camera_link
+tool_frame: tool0
+board_frame: calibration_board
+translation:
+  x: 0.4781208934673015
+  y: 0.31847792916055645
+  z: 0.5496179087487513
+rotation:
+  x: -0.6714720490089796
+  y: -0.6918352940427999
+  z: 0.24034110704250042
+  w: 0.11280676212878664
+T_base_camera:
+- - -0.07279984363540438
+  - 0.8748719207514726
+  - -0.4788520701085993
+  - 0.4781208934673015
+- - 0.983320329119123
+  - -0.017277120669464643
+  - -0.18105974550527087
+  - 0.31847792916055645
+- - -0.16667727231905807
+  - -0.48404609634001067
+  - -0.8590215733672103
+  - 0.5496179087487513
+- - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+T_tool_board:
+- - -0.13918604608398
+  - -0.9897065694004298
+  - -0.03328890297292458
+  - 0.14690700424803463
+- - 0.013319782331250196
+  - -0.03548416554878275
+  - 0.9992814705546956
+  - 0.027098146732785874
+- - -0.9901766650321329
+  - 0.13864263586984749
+  - 0.018121576777546444
+  - 0.07364290058593581
+- - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+tool_board_translation:
+  x: 0.14690700424803463
+  y: 0.027098146732785874
+  z: 0.07364290058593581
+tool_board_rotation:
+  x: -0.4685553709774482
+  y: 0.5209559251409016
+  z: 0.5460750379779113
+  w: 0.4591980414659845
+solver: HORAUD
+samples:
+  total: 24
+  train: 24
+  used: 24
+  holdout: 0
+  source: /home/quella/arx/arm/src/x5a_handeye/data/manual_samples_recalib_20260813.json
+  collection: manual_gravity_readonly_urdf_fk
+  used_indices:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  - 17
+  - 18
+  - 19
+  - 20
+  - 21
+  - 22
+  - 23
+motion_diversity:
+  ok: true
+  n_motions: 23
+  angles_deg_mean: 35.552131659080935
+  angles_deg_max: 111.37986084870064
+  max_abs_axis_dot: 0.9994012333897987
+  parallel_warning: true
+error:
+  translation_mean_m: 0.02278806297210255
+  translation_median_m: 0.022993715157435802
+  translation_max_m: 0.03642985124226041
+  rotation_mean_deg: 9.17061297787433
+  rotation_max_deg: 12.242244494455852
+holdout_error: null
+all_samples_error:
+  translation_mean_m: 0.02278806297210255
+  translation_median_m: 0.022993715157435802
+  translation_max_m: 0.03642985124226041
+  rotation_mean_deg: 9.17061297787433
+  n_under_15mm: 5
+solver_comparison:
+- solver: HORAUD
+  translation_mean_m: 0.02278806297210255
+  rotation_mean_deg: 9.17061297787433
+- solver: PARK
+  translation_mean_m: 0.022812505959595872
+  rotation_mean_deg: 9.17097328475164
+- solver: DANIILIDIS
+  translation_mean_m: 0.02414559613975738
+  rotation_mean_deg: 9.271194665145975
+- solver: TSAI
+  translation_mean_m: 0.0646464695896694
+  rotation_mean_deg: 17.93975615222814
+- solver: ANDREFF
+  translation_mean_m: 0.10271489326142674
+  rotation_mean_deg: 9.244141686130007
+verdict: FAIL
+pass_criteria_mm: 10.0

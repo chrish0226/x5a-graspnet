@@ -1,0 +1,304 @@
+[
+  {
+    "rotation": 0,
+    "gap_m": 0.002,
+    "tool_xyz": [
+      0.1689771633700825,
+      0.2796934396131255,
+      0.10493359170444089
+    ],
+    "ik_code": 1,
+    "valid": false,
+    "contacts": [
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link7",
+        "depth": 0.007044161738210444
+      },
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link8",
+        "depth": 0.004437736431467831
+      }
+    ]
+  },
+  {
+    "rotation": 0,
+    "gap_m": 0.005,
+    "tool_xyz": [
+      0.1689771633700825,
+      0.2796934396131255,
+      0.10793359170444089
+    ],
+    "ik_code": 1,
+    "valid": false,
+    "contacts": [
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link7",
+        "depth": 0.004044155092577287
+      },
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link8",
+        "depth": 0.0024751280924329433
+      }
+    ]
+  },
+  {
+    "rotation": 0,
+    "gap_m": 0.008,
+    "tool_xyz": [
+      0.1689771633700825,
+      0.2796934396131255,
+      0.11093359170444089
+    ],
+    "ik_code": 1,
+    "valid": false,
+    "contacts": [
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link7",
+        "depth": 0.0006692278431911919
+      },
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link8",
+        "depth": 0.0008969262800061911
+      }
+    ]
+  },
+  {
+    "rotation": 0,
+    "gap_m": 0.011,
+    "tool_xyz": [
+      0.1689771633700825,
+      0.2796934396131255,
+      0.11393359170444088
+    ],
+    "ik_code": 1,
+    "valid": false,
+    "contacts": [
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link7",
+        "depth": 0.0038921178275481833
+      },
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link8",
+        "depth": 0.0037648046425397957
+      }
+    ]
+  },
+  {
+    "rotation": 0,
+    "gap_m": 0.014,
+    "tool_xyz": [
+      0.1689771633700825,
+      0.2796934396131255,
+      0.11693359170444088
+    ],
+    "ik_code": 1,
+    "valid": false,
+    "contacts": [
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link7",
+        "depth": 0.0008940029046880238
+      },
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link8",
+        "depth": 0.0007664962707547157
+      }
+    ]
+  },
+  {
+    "rotation": 0,
+    "gap_m": 0.017,
+    "tool_xyz": [
+      0.1689771633700825,
+      0.2796934396131255,
+      0.11993359170444089
+    ],
+    "ik_code": 1,
+    "valid": true,
+    "contacts": []
+  },
+  {
+    "rotation": 0,
+    "gap_m": 0.02,
+    "tool_xyz": [
+      0.1689771633700825,
+      0.2796934396131255,
+      0.12293359170444089
+    ],
+    "ik_code": 1,
+    "valid": true,
+    "contacts": []
+  },
+  {
+    "rotation": 0,
+    "gap_m": 0.023,
+    "tool_xyz": [
+      0.1689771633700825,
+      0.2796934396131255,
+      0.12593359170444088
+    ],
+    "ik_code": 1,
+    "valid": true,
+    "contacts": []
+  },
+  {
+    "rotation": 1,
+    "gap_m": 0.002,
+    "tool_xyz": [
+      0.16907815991697908,
+      0.27967574822742486,
+      0.10493359170444089
+    ],
+    "ik_code": 1,
+    "valid": false,
+    "contacts": [
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link7",
+        "depth": 0.007044176391144769
+      },
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link8",
+        "depth": 0.004437751463609779
+      }
+    ]
+  },
+  {
+    "rotation": 1,
+    "gap_m": 0.005,
+    "tool_xyz": [
+      0.16907815991697908,
+      0.27967574822742486,
+      0.10793359170444089
+    ],
+    "ik_code": 1,
+    "valid": false,
+    "contacts": [
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link7",
+        "depth": 0.004044156387501732
+      },
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link8",
+        "depth": 0.0022884220378907028
+      }
+    ]
+  },
+  {
+    "rotation": 1,
+    "gap_m": 0.008,
+    "tool_xyz": [
+      0.16907815991697908,
+      0.27967574822742486,
+      0.11093359170444089
+    ],
+    "ik_code": 1,
+    "valid": false,
+    "contacts": [
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link7",
+        "depth": 0.0006692874393796344
+      },
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link8",
+        "depth": 0.000896982528363871
+      }
+    ]
+  },
+  {
+    "rotation": 1,
+    "gap_m": 0.011,
+    "tool_xyz": [
+      0.16907815991697908,
+      0.27967574822742486,
+      0.11393359170444088
+    ],
+    "ik_code": 1,
+    "valid": false,
+    "contacts": [
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link7",
+        "depth": 0.0038921066431244905
+      },
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link8",
+        "depth": 0.003764793375719361
+      }
+    ]
+  },
+  {
+    "rotation": 1,
+    "gap_m": 0.014,
+    "tool_xyz": [
+      0.16907815991697908,
+      0.27967574822742486,
+      0.11693359170444088
+    ],
+    "ik_code": 1,
+    "valid": false,
+    "contacts": [
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link7",
+        "depth": 0.0008921184449219022
+      },
+      {
+        "a": "remote_grasp_place_support",
+        "b": "link8",
+        "depth": 0.0007648052538418576
+      }
+    ]
+  },
+  {
+    "rotation": 1,
+    "gap_m": 0.017,
+    "tool_xyz": [
+      0.16907815991697908,
+      0.27967574822742486,
+      0.11993359170444089
+    ],
+    "ik_code": 1,
+    "valid": true,
+    "contacts": []
+  },
+  {
+    "rotation": 1,
+    "gap_m": 0.02,
+    "tool_xyz": [
+      0.16907815991697908,
+      0.27967574822742486,
+      0.12293359170444089
+    ],
+    "ik_code": 1,
+    "valid": true,
+    "contacts": []
+  },
+  {
+    "rotation": 1,
+    "gap_m": 0.023,
+    "tool_xyz": [
+      0.16907815991697908,
+      0.27967574822742486,
+      0.12593359170444088
+    ],
+    "ik_code": 1,
+    "valid": true,
+    "contacts": []
+  }
+]

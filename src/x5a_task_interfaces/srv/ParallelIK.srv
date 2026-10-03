@@ -1,0 +1,16 @@
+# Complete snapshot from the authoritative MoveIt planning scene. Never a diff.
+moveit_msgs/PlanningScene scene
+# SHA256(URDF + NUL + SRDF) from the running /move_group parameters.
+string model_digest
+# Priority ordered seeds/poses. Each worker owns its model, solver and scene.
+moveit_msgs/PositionIKRequest[] requests
+uint32 workers
+float64 total_budget_s
+---
+# True means the batch contract was valid, not that any IK succeeded.
+bool success
+string message
+string model_digest
+moveit_msgs/MoveItErrorCodes[] error_codes
+moveit_msgs/RobotState[] solutions
+float64 elapsed_s

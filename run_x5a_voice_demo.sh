@@ -8,12 +8,14 @@ ROS_SETUP="/opt/ros/humble/setup.bash"
 HTTPS=false
 DRY_RUN=false
 PLAN_ONLY=false
+TERMINAL=false
 PORT=8000
 while (( $# > 0 )); do
   case "$1" in
     --https) HTTPS=true ;;
     --dry-run) DRY_RUN=true ;;
     --plan-only) PLAN_ONLY=true ;;
+    --terminal) TERMINAL=true ;;
     --port) shift; PORT="${1}" ;;
     --help|-h)
       cat <<'EOF'
@@ -22,6 +24,7 @@ Usage:
   ./run_x5a_voice_demo.sh --plan-only
   ./run_x5a_voice_demo.sh --dry-run
   ./run_x5a_voice_demo.sh --https --port 8000
+  ./run_x5a_voice_demo.sh --terminal
 
 Starts only:
   - x5a_task_server   (/x5a/pick_place)
@@ -30,6 +33,9 @@ Starts only:
 Does not start X5Controller, MoveIt, vision, or pick_place_node.
 Bring those up first, or reuse an already running stack.
 Never start this together with x5a_pick_place/pick_place_node.
+
+--terminal adds a text input layer to this terminal: typed text goes through
+the same parse/dispatch path as phone speech. /help lists its commands.
 EOF
       exit 0
       ;;
@@ -111,6 +117,7 @@ echo "task_server: /x5a/pick_place"
 echo "web:         ${SCHEME}://${HOST_IP}:${PORT}"
 echo "plan_only:   ${PLAN_ONLY}"
 echo "web dry-run: ${DRY_RUN}"
+echo "terminal:    ${TERMINAL}"
 echo "This script does not publish /arm_cmd."
 echo
 
@@ -132,10 +139,15 @@ sleep 1
 EXTRA=()
 [[ "${DRY_RUN}" == "true" ]] && EXTRA+=(--dry-run)
 [[ "${HTTPS}" == "true" ]] && EXTRA+=(--https)
+[[ "${TERMINAL}" == "true" ]] && EXTRA+=(--terminal)
 ros2 run x5a_web_agent web_agent --host 0.0.0.0 --port "${PORT}" "${EXTRA[@]}" &
 WEB_PID=$!
 
 echo "Phone browser:"
 echo "  ${SCHEME}://${HOST_IP}:${PORT}"
+if [[ "${TERMINAL}" == "true" ]]; then
+  echo "Terminal input layer is on: type text here (same path as phone speech),"
+  echo "  /help 看命令，Ctrl-D 或 /quit 只关掉输入层，Ctrl-C 停整栈。"
+fi
 echo
 wait

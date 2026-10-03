@@ -1120,8 +1120,9 @@ class PickPlaceNode(Node):
 
             path = Path(get_package_share_directory("x5a_handeye")) / "config" / "handeye_result.yaml"
             data = yaml.safe_load(path.read_text())
-            hold = data.get("holdout_error", {})
-            samples = data.get("samples", {})
+            # yaml 里键存在但值为 null（如全样本训练时 holdout_error: null）
+            hold = data.get("holdout_error") or {}
+            samples = data.get("samples") or {}
             self.log_stage(
                 "HANDEYE",
                 file=str(path),

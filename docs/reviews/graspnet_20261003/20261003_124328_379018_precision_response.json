@@ -1,0 +1,34 @@
+{
+  "convention": {
+    "x": "right",
+    "y": "down",
+    "z": "forward",
+    "units": "metres",
+    "approach_axis": "grasp_x",
+    "frame": "camera_color_optical_frame"
+  },
+  "frame": "camera_color_optical_frame",
+  "grasps": [],
+  "object_band_cam": [
+    [
+      0.03288,
+      -0.10529,
+      0.495
+    ],
+    [
+      0.03288,
+      -0.10529,
+      0.518
+    ]
+  ],
+  "num_points": 2225,
+  "instance": {
+    "selected_by": "client_mask"
+  },
+  "latency_s": 0.685,
+  "target_distance_thresh_applied": true,
+  "target_mask_png_b64": "iVBORw0KGgoAAAANSUhEUgAAAoAAAAHgCAAAAAAQuoM4AAACmUlEQVR4nO3dMW4CQQxAUU+U+195UgRQBMvupPAYye81UKRYmY8HSLERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAzY3qC2hihlkfMpQt5u+Dab8wkh3m45l5P/mqvoAO7v2NiDlP/7If78gNnqIz8z8MI9/r0jP1B0dwBQfxgwDTHcamwBsB7jdGWIJ3Po1kOwnN8G3AdGeLbjqJBVhp2IEmkOxqxY2YvV8CG7Ba7/4EmGvtM17nb8TN33/JlsIaMRu/Dt/VF0Dj9ReO4FS901ojwDz6WyBASgkwjQW4QoBZ/tVf2y/BAqSWAJNYgGsESCkB5vANZJEAP0DjE1iAOSzAVQKklADrdT6BBUgtAWbwI+AyAVJKgJQSYLXeJ7AAqSXAYs0XoACLde9PgBn8I26dAEu1X4ACLKU/AVJLgIUsQAFSTIAJFjebBRgCzCGtZUaV5Pq3QKOPMIVEFwmafEQ4ghMpbIUpZXKPkEs2YKYhsysmlO14C5r7jQ2YzRY8JcB8EjxhNnu4afobNuAetuAbAtxlvHnenAC3sQSPCHCj8fSIWezW+bZwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADwiX4AMcMpdwvDP7gAAAAASUVORK5CYII=",
+  "quality_schema": 2,
+  "sampling_seed": 65060551,
+  "collision_checked": true
+}

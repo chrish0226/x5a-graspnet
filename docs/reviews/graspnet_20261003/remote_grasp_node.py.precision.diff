@@ -1,0 +1,857 @@
+--- /tmp/x5a_grasp_precision_before_20261003/src/x5a_remote_grasp/x5a_remote_grasp/remote_grasp_node.py
+
++++ src/x5a_remote_grasp/x5a_remote_grasp/remote_grasp_node.py
+
+@@ -3,13 +3,14 @@
+
+ from __future__ import annotations
+ 
+ import json
++import base64
+ import math
+ import os
+ import re
+ import subprocess
+ import threading
+ import time
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from datetime import datetime
+ from pathlib import Path
+ from typing import Dict, List, Optional, Sequence, Tuple
+@@ -56,6 +57,10 @@
+
+ )
+ from x5a_remote_grasp.moveit_plan import PlanOnlyMoveIt, SequencePlan
+ from x5a_remote_grasp.reachability import ReachabilityTable
++from x5a_remote_grasp.grasp_quality import (
++    GripperGeometry, assess_tool_grasp, depth_cloud, height_statistics,
++    graspnet_tool_transform, recenter_tool, voxel_cloud,
++)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -98,6 +103,9 @@
+
+         self.latest_frame: Optional[SynchronizedFrame] = None
+         self.latest_joints: Optional[List[float]] = None
+         self.last_successful_seed: Optional[List[float]] = None
++        self.target_cloud = None
++        self.scene_cloud = None
++        self.last_plan_validation = None
+         self.goal_active = False
+         self.depth_scale_logged = False
+         self.tf_buffer = Buffer()
+@@ -135,7 +143,7 @@
+
+         path_qos.reliability = ReliabilityPolicy.RELIABLE
+         path_qos.durability = DurabilityPolicy.VOLATILE
+         self.display_publisher = self.create_publisher(
+-            DisplayTrajectory, "/display_planned_path", path_qos
++            DisplayTrajectory, str(self.get_parameter('topics.display_path').value), path_qos
+         )
+         self.create_subscription(
+             JointState, "/joint_states", self._joint_state_cb, 10
+@@ -153,6 +161,10 @@
+
+             Trigger,
+             self.save_snapshot_service,
+             self._save_snapshot_callback,
++            callback_group=self.callback_group,
++        )
++        self.validation_server = self.create_service(
++            Trigger, str(self.get_parameter('validation_service').value), self._validate_latest_callback,
+             callback_group=self.callback_group,
+         )
+         self.action_server = ActionServer(
+@@ -206,7 +218,7 @@
+
+             "remote.mask_dilation_px": 8,
+             "remote.num_point": 20000,
+             "remote.top_k_default": 10,
+-            "remote.top_k_max": 20,
++            "remote.top_k_max": 40,
+             "remote.collision_thresh": 0.01,
+             "remote.voxel_size": 0.01,
+             "remote.target_distance_thresh": 0.06,
+@@ -252,12 +264,20 @@
+
+             "grasp.aperture_tolerance_m": 0.005,
+             "grasp.center_band_enabled": True,
+             "grasp.center_band_margin_m": 0.007,
++            "grasp.finger_length_m": 0.10,
++            "grasp.finger_thickness_m": 0.01,
++            "grasp.finger_height_m": 0.02,
++            "grasp.pad_length_m": 0.03,
++            "grasp.tip_offset_m": 0.015,
++            "grasp.native_budget_fraction": 0.45,
++            "grasp.max_target_motion_m": 0.01,
++            "grasp.max_capture_to_execute_s": 60.0,
+             "grasp.approach_offset_m": 0.0,
+             "grasp.max_approach_z": 0.35,
+             "grasp.allow_reachable_fallback": True,
+             "poses.ready_joints": [0.72, 0.85, 0.95, -0.55, 0.0, 0.0],
+             "grasp.place_object_half_height_m": 0.025,
+-            "grasp.place_pitches": [1.45, 1.15],
++            "grasp.place_pitches": [1.45, 1.15, 0.90, 0.75],
+             "grasp.transit_pitches": [1.15, 0.90],
+             # 可解性阶梯：姿态按可达性表/经验规律排序后逐个降级尝试
+             "grasp.pitch_ladder": [1.45, 1.15, 0.90, 0.75],
+@@ -303,6 +323,8 @@
+
+             "markers.lifetime_s": 60.0,
+             "capture.directory": "/home/quella/.local/share/x5a_remote_grasp/captures",
+             "action_name": "/x5a_remote_grasp/plan",
++            "topics.display_path": "/display_planned_path",
++            "validation_service": "/x5a_remote_grasp/validate_latest",
+             "health_service": "/x5a_remote_grasp/health",
+             "save_snapshot_service": "/x5a_remote_grasp/save_snapshot",
+         }
+@@ -374,6 +396,17 @@
+
+         # 2.3/3.1cm，物体真实带 0.6~3.3cm），波段外的抓取只能擦边。
+         self.center_band_enabled = bool(value("grasp.center_band_enabled"))
+         self.center_band_margin_m = float(value("grasp.center_band_margin_m"))
++        self.gripper_geometry = GripperGeometry(
++            tip_offset=float(value('grasp.tip_offset_m')),
++            finger_length=float(value('grasp.finger_length_m')),
++            finger_thickness=float(value('grasp.finger_thickness_m')),
++            finger_height=float(value('grasp.finger_height_m')),
++            pad_length=float(value('grasp.pad_length_m')),
++            max_width=self.max_gripper_width, opening_margin=self.width_margin,
++        )
++        self.native_budget_fraction = float(value('grasp.native_budget_fraction'))
++        self.max_target_motion = float(value('grasp.max_target_motion_m'))
++        self.max_capture_to_execute = float(value('grasp.max_capture_to_execute_s'))
+         self.approach_offset_m = float(value("grasp.approach_offset_m"))
+         self.max_approach_z = float(value("grasp.max_approach_z"))
+         self.allow_reachable_fallback = bool(value("grasp.allow_reachable_fallback"))
+@@ -750,10 +783,62 @@
+
+         self.get_logger().info(f"saved synchronized RGB-D snapshot at {directory}")
+         return directory
+ 
++    def _quality_clouds(self, encoded, payload, transform):
++        raw_mask = payload.get('target_mask_png_b64')
++        if payload.get('quality_schema') != 2 or not isinstance(raw_mask, str):
++            raise RuntimeError('cloud service lacks quality_schema=2/original target mask; update GraspNet service')
++        mask = cv2.imdecode(np.frombuffer(base64.b64decode(raw_mask, validate=True), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
++        depth = cv2.imdecode(np.frombuffer(encoded.depth_png, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
++        if mask is None or depth is None or mask.shape != depth.shape:
++            raise RuntimeError('target mask does not match the captured aligned depth')
++        depth_m = depth.astype(float)*encoded.depth_scale_m_per_unit
++        cloud = depth_cloud(depth_m, encoded.fx, encoded.fy, encoded.cx, encoded.cy)
++        valid = np.isfinite(depth_m) & (depth_m >= self.min_depth_default) & (depth_m <= self.max_depth_default)
++        target_camera = cloud[(mask > 127) & valid]
++        target, center, low, high = height_statistics(target_camera, transform)
++        full_scene = cloud[valid] @ transform[:3, :3].T + transform[:3, 3]
++        lo, hi = np.min(target, axis=0)-0.22, np.max(target, axis=0)+0.22
++        scene = full_scene[np.all((full_scene >= lo) & (full_scene <= hi), axis=1)]
++        return target, voxel_cloud(scene), center, (low, high)
++
++    def _validate_latest_callback(self, _request, response):
++        """Perception-only pre-execution check; never sends controller goals."""
++        try:
++            expected = self.last_plan_validation
++            if expected is None or self.goal_active:
++                raise RuntimeError('没有已验证的新规划，或正在重新规划')
++            if time.monotonic()-expected['captured_monotonic'] > self.max_capture_to_execute:
++                raise RuntimeError('规划使用的图像已过期，请重新规划')
++            encoded = self._encode_latest_frame()
++            located = self._api_client().locate(encoded.rgb_png, encoded.depth_png, {
++                'prompt': expected['prompt'], 'fx': encoded.fx, 'fy': encoded.fy,
++                'cx': encoded.cx, 'cy': encoded.cy, 'depth_scale': encoded.depth_scale_divisor,
++                'threshold': self.threshold, 'min_depth': self.min_depth_default,
++                'max_depth': self.max_depth_default, 'mask_dilation_px': 0,
++            })
++            transform = self._lookup_matrix(self.base_frame, encoded.source_frame, encoded.stamp)
++            target, scene, center, _ = self._quality_clouds(encoded, located, transform)
++            shift = float(np.linalg.norm(center-expected['center']))
++            if shift > self.max_target_motion:
++                raise RuntimeError(f'目标移动 {shift*1000:.1f}mm，请重新规划')
++            if expected.get('tool') is not None:
++                assessment = assess_tool_grasp(target, scene, expected['tool'], self.gripper_geometry, self.pregrasp_distance)
++                if not assessment['valid']:
++                    raise RuntimeError('执行前抓取几何已变化: '+assessment['reason'])
++            response.success = True
++            response.message = json.dumps({'plan_fingerprint': expected['fingerprint'], 'motion_m': shift,
++                                           'tool': None if expected.get('tool') is None else expected['tool'].tolist()})
++        except Exception as exc:
++            response.success = False
++            response.message = str(exc)
++        return response
++
+     def _execute_callback(self, goal_handle):
+         result = self._new_result()
+         capture_directory: Optional[Path] = None
+         try:
++            self.last_plan_validation = None
++            captured_monotonic = time.monotonic()
+             self._feedback(goal_handle, "CAPTURE")
+             self._refresh_reachability()
+             encoded = self._encode_latest_frame()
+@@ -811,8 +896,6 @@
+
+             )
+             grasps = parse_api_grasps(payload)
+             result.candidate_count = len(grasps)
+-            if not grasps:
+-                return self._finish_error(goal_handle, result, "remote service returned no grasp candidates")
+             if goal_handle.is_cancel_requested:
+                 goal_handle.canceled()
+                 result.error_message = "request canceled after remote inference"
+@@ -827,34 +910,17 @@
+
+             for transform in base_grasps:
+                 validate_homogeneous(transform)
+             self._publish_grasp_markers(grasps, base_grasps, encoded.stamp)
+-            top = max(range(len(grasps)), key=lambda index: grasps[index].score)
+-            self.get_logger().info(
++            top = max(range(len(grasps)), key=lambda index: grasps[index].score) if grasps else None
++            if top is not None:
++                self.get_logger().info(
+                 "API/TF summary: "
+                 f"api_frame={payload.get('frame')!r} source_frame={encoded.source_frame} "
+                 f"candidates={len(grasps)} top_camera_xyz="
+                 f"{grasps[top].transform_camera_grasp[:3, 3].round(5).tolist()} "
+                 f"top_base_xyz={base_grasps[top][:3, 3].round(5).tolist()}"
+             )
+-            center_band: Optional[Tuple[float, float]] = None
+-            raw_band = payload.get("object_band_cam")
+-            if self.center_band_enabled and isinstance(raw_band, list) and len(raw_band) == 2:
+-                try:
+-                    band_base = [
+-                        transform_base_camera[:3, :3] @ np.asarray(point, dtype=float)
+-                        + transform_base_camera[:3, 3]
+-                        for point in raw_band
+-                    ]
+-                    # 相机俯视 ~45°：相机系 z 的 p5（近处点）对应 base 系高处，
+-                    # p95 对应低处，所以这里必须排序后再当 (lo, hi) 用。
+-                    center_band = tuple(
+-                        sorted((float(band_base[0][2]), float(band_base[1][2])))
+-                    )
+-                    self.get_logger().info(
+-                        f"object center band (base z): "
+-                        f"{center_band[0] * 100:.1f}~{center_band[1] * 100:.1f}cm"
+-                    )
+-                except Exception as exc:
+-                    self.get_logger().warn(f"center band transform failed, fail-open: {exc}")
++            self.target_cloud, self.scene_cloud, geometric_center, center_band = self._quality_clouds(encoded, payload, transform_base_camera)
++            (capture_directory/'target_cloud_base.npy').write_bytes(self._numpy_bytes(self.target_cloud))
+ 
+             summary = {
+                 "api_frame": payload.get("frame"),
+@@ -907,19 +973,7 @@
+
+ 
+             def centroid_locate():
+                 """保底抓取用：/v1/locate 返回物体质心（base 系）。"""
+-                located = self._api_client().locate(
+-                    encoded.rgb_png, encoded.depth_png, {
+-                        "prompt": grasp_prompt or place_prompt or "",
+-                        "fx": encoded.fx, "fy": encoded.fy,
+-                        "cx": encoded.cx, "cy": encoded.cy,
+-                        "depth_scale": encoded.depth_scale_divisor,
+-                        "threshold": self.threshold,
+-                        "mask_dilation_px": self.mask_dilation_px,
+-                        "min_depth": min_depth, "max_depth": max_depth,
+-                    }
+-                )
+-                center_cam = np.asarray(located["center_cam"], dtype=float)
+-                return transform_base_camera[:3, :3] @ center_cam + transform_base_camera[:3, 3]
++                return geometric_center.copy()
+ 
+             selected = self._select_candidate(
+                 goal_handle,
+@@ -948,7 +1002,7 @@
+
+             grasp, waypoints, plan = selected
+             if grasp is not None:
+                 self.get_logger().info(
+-                    "selected GraspNet pose: "
++                    f"selected {self.selection_kind} pose: "
+                     f"#{grasp.index} score={grasp.score:.3f} width={grasp.width_m:.3f} "
+                     f"mode={self.orientation_mode} "
+                     f"approach={waypoints['grasp'][:3, 0].round(3).tolist()} "
+@@ -971,6 +1025,12 @@
+
+             result.plan_valid = plan is not None
+             result.planned_stages = [] if plan is None else list(plan.stages) + ["CLOSE_GRIPPER_DIAGNOSTIC_ONLY"]
+             if plan is not None:
++                from x5a_remote_grasp.grasp_quality import trajectory_fingerprint
++                self.last_plan_validation = {
++                    'captured_monotonic': captured_monotonic, 'prompt': api_prompt,
++                    'center': geometric_center, 'tool': waypoints['grasp'],
++                    'fingerprint': trajectory_fingerprint(plan.trajectories),
++                }
+                 self.display_publisher.publish(self.planner.display_message(plan))
+             result.success = True
+             result.error_message = ""
+@@ -979,8 +1039,16 @@
+
+         except (RemoteAPIError, TransformException, RuntimeError, ValueError, OSError) as exc:
+             return self._finish_error(goal_handle, result, str(exc))
+         finally:
++            self.planner.deadline = None
+             with self.goal_lock:
+                 self.goal_active = False
++
++    @staticmethod
++    def _numpy_bytes(array):
++        import io
++        buffer = io.BytesIO()
++        np.save(buffer, array)
++        return buffer.getvalue()
+ 
+     def _lookup_matrix(self, target: str, source: str, stamp) -> np.ndarray:
+         transform = self.tf_buffer.lookup_transform(
+@@ -1064,18 +1132,9 @@
+
+         })
+         if not isinstance(located, dict) or "center_cam" not in located or "top_cam" not in located:
+             return None
+-        center_b = transform_base_camera[:3, :3] @ np.asarray(
+-            located["center_cam"], dtype=float) + transform_base_camera[:3, 3]
+-        top_b = transform_base_camera[:3, :3] @ np.asarray(
+-            located["top_cam"], dtype=float) + transform_base_camera[:3, 3]
+-        # /v1/locate 的 top_cam = p95(相机系 z) = 离相机最远的点。本相机俯视
+-        # ~45°，最远端是物体贴桌面的一侧——「top」长期是反的（2026-10-03 方块
+-        # top_b 算出 -0.5cm，place_z 塌到 min_tool0 下限，手里的物体戳进桌面）。
+-        # 真实顶面 = center + |R_zz|×(top-center 的相机 z 差)，对两个端点取高者。
+-        delta_cam_z = float(located["top_cam"][2]) - float(located["center_cam"][2])
+-        r_zz = float(transform_base_camera[2, 2])
+-        z_top = max(float(top_b[2]),
+-                    float(center_b[2]) + abs(r_zz) * abs(delta_cam_z))
++        _, _, center_b, band = self._quality_clouds(encoded, located, transform_base_camera)
++        self.last_place_center = center_b.copy()
++        z_top = band[1]
+         place_z = max(z_top + self.place_object_half_height_m,
+                       self.min_tool0_height_m)
+         place_target = (
+@@ -1154,311 +1213,201 @@
+
+         result.gripper_width_m = 0.0
+         result.score = 0.0
+         result.selected_index = 0
++        from x5a_remote_grasp.grasp_quality import trajectory_fingerprint
++        self.last_plan_validation = {
++            'captured_monotonic': deadline-self.plan_budget_s,
++            'prompt': place_prompt, 'center': self.last_place_center,
++            'tool': None, 'fingerprint': trajectory_fingerprint(plan.trajectories),
++        }
+         self.display_publisher.publish(self.planner.display_message(plan))
+         result.success = True
+         result.error_message = ""
+         goal_handle.succeed()
+         return result
+ 
+-    def _plan_place_only(
+-        self, goal_handle, place_target, stamp, deadline: float,
+-        report: Optional[List[dict]] = None,
+-        capture_directory: Optional[Path] = None,
+-    ) -> Optional[Tuple[Dict[str, np.ndarray], SequencePlan]]:
+-        """放置点 + 姿态阶梯 + 就近偏移，从当前位姿规划 TRANSPORT/PLACE/RETREAT。"""
+-        points = self._place_point_candidates(place_target)
+-        failures: List[str] = []
+-        orientation_count = 0
+-        for _grasp_R, transit_R, kind in self._template_orientation_variants(points[0]):
+-            orientation_count += 1
+-            if self._budget_exhausted(deadline):
+-                failures.append(f"BUDGET:已用满 {self.plan_budget_s:.0f}s 规划预算")
+-                break
+-            for place_xyz in points:
+-                built, updates = self._place_poses(
+-                    float(place_xyz[2]), transit_R, place_xyz, stamp, failures
+-                )
+-                if built is None:
+-                    continue
+-                poses = list(built)
+-                if capture_directory is not None:
+-                    try:
+-                        dump_path = capture_directory / "ik_poses.json"
+-                        entries = json.loads(dump_path.read_text()) if dump_path.exists() else []
+-                        entries.append({
+-                            "label": "place-only",
+-                            "orientation_index": orientation_count,
+-                            "kind": kind,
+-                            "place_point": np.asarray(place_xyz).round(5).tolist(),
+-                            "poses": {
+-                                name: [
+-                                    p.pose.position.x, p.pose.position.y, p.pose.position.z,
+-                                    p.pose.orientation.x, p.pose.orientation.y,
+-                                    p.pose.orientation.z, p.pose.orientation.w,
+-                                ]
+-                                for name, p in poses
+-                            },
+-                        })
+-                        dump_path.write_text(json.dumps(entries, indent=1) + "\n")
+-                    except Exception:
+-                        pass
+-                ik_seeds = self._ik_joint_seeds(float(place_xyz[0]), float(place_xyz[1]))
+-                ik_valid, reason = self.planner.validate_waypoint_ik(
+-                    poses, extra_joint_seeds=ik_seeds
+-                )
+-                if not ik_valid:
+-                    failures.append(f"IK:{reason}")
+-                    continue
+-                self.planner.default_joint_seeds = ik_seeds
+-                plan, reason = self.planner.plan_sequence(poses)
+-                if plan is None:
+-                    failures.append(f"PLAN:{reason}")
+-                    continue
+-                if self.planner.last_solution_seed is not None:
+-                    self.last_successful_seed = list(self.planner.last_solution_seed)
+-                self.get_logger().info(
+-                    "place-only plan: "
+-                    f"stages={list(plan.stages)} target={np.asarray(place_xyz).round(3).tolist()} "
+-                    f"orientation={kind}"
+-                )
+-                return updates, plan
+-        if report is not None:
+-            unique = list(dict.fromkeys(failures))[:3]
+-            report.append({
+-                "index": -1,
+-                "score": None,
+-                "reason": f"{orientation_count} orientations failed",
+-                "detail": "; ".join(unique) if unique else "unknown",
+-            })
++    def _plan_place_only(self, goal_handle, place_target, stamp, deadline,
++                         report=None, capture_directory=None):
++        failures = []
++        self.planner.deadline = deadline
++        for place_xyz in self._place_point_candidates(place_target):
++            yaw = math.atan2(place_xyz[1], place_xyz[0])
++            for pitch in self.transit_pitches:
++                transit = rpy_rotation(0, pitch, yaw)
++                for poses, waypoints in self._place_pose_variants(float(place_xyz[2]), transit, place_xyz, stamp):
++                    if goal_handle.is_cancel_requested or self._budget_exhausted(deadline):
++                        return None
++                    self.planner.default_joint_seeds = self._ik_joint_seeds(*place_xyz[:2])
++                    plan, reason = self.planner.plan_sequence(poses)
++                    if plan is not None:
++                        self.get_logger().info(f'place-only plan: stages={plan.stages} target={place_xyz.tolist()}')
++                        return waypoints, plan
++                    failures.append(reason)
++        self._record_reject(report, goal_handle, None, 'place_plan', '; '.join(dict.fromkeys(failures))[:600])
+         return None
+ 
+     def _select_candidate(
+-        self,
+-        goal_handle,
+-        grasps: Sequence[RemoteGrasp],
+-        base_grasps: Sequence[np.ndarray],
+-        stamp,
+-        plan_motion: bool,
+-        capture_directory: Optional[Path] = None,
+-        place_target=None,
+-        report: Optional[List[dict]] = None,
+-        centroid_locate=None,
+-        center_band: Optional[Tuple[float, float]] = None,
+-    ) -> Optional[Tuple[RemoteGrasp, Dict[str, np.ndarray], Optional[SequencePlan]]]:
+-        indexed = list(zip(grasps, base_grasps))
+-        indexed.sort(key=lambda item: item[0].score, reverse=True)
++        self, goal_handle, grasps, base_grasps, stamp, plan_motion,
++        capture_directory=None, place_target=None, report=None,
++        centroid_locate=None, center_band=None,
++    ):
++        if self.target_cloud is None or self.scene_cloud is None:
++            raise RuntimeError('no original-target/scene geometry for grasp validation')
+         if plan_motion:
+-            if not self.planning_enabled:
+-                raise RuntimeError("goal requests planning but planning.enabled is false")
+             ready, reason = self.planner.ready()
+-            if not ready:
+-                raise RuntimeError(reason)
+-            scene = self._safety_scene(stamp)
+-            applied, reason = self.planner.apply_scene(scene)
++            if not self.planning_enabled or not ready:
++                raise RuntimeError(reason or 'planning is disabled')
++            applied, reason = self.planner.apply_scene(self._safety_scene(stamp))
+             if not applied:
+                 raise RuntimeError(reason)
+-        deadline = time.monotonic() + max(1.0, self.plan_budget_s)
+-        sources: List[Tuple[Optional[RemoteGrasp], np.ndarray, List[Tuple[np.ndarray, np.ndarray, str]]]] = []
+-        for grasp, transform_base_grasp in indexed:
+-            self._feedback(goal_handle, "CANDIDATE_CHECK", grasp.index, f"score={grasp.score:.4f}")
+-            if goal_handle.is_cancel_requested:
+-                return None
+-            if grasp.score < self.min_score:
+-                self._record_reject(report, goal_handle, grasp, "score",
+-                                    f"score {grasp.score:.4f} below min_score {self.min_score:.3f}")
++        started = time.monotonic()
++        deadline = started + self.plan_budget_s
++        native_deadline = started + self.plan_budget_s*self.native_budget_fraction
++        indexed = sorted(zip(grasps, base_grasps), key=lambda pair: pair[0].score, reverse=True)
++        # Phase 1 is exclusively model poses + the equivalent jaw swap. No
++        # modified pose from candidate #0 can outrank candidate #1's native pose.
++        native = []
++        for grasp, transform in indexed:
++            if grasp.score < self.min_score or approach_from_below(transform, self.max_approach_z):
++                self._record_reject(report, goal_handle, grasp, 'score_or_approach', 'native candidate rejected')
+                 continue
+-            if not (0.0 < grasp.width_m <= self.max_gripper_width):
+-                self._record_reject(report, goal_handle, grasp, "width", "gripper width")
+-                continue
+-            if self.aperture_audit_enabled and grasp.required_opening_m is not None:
+-                required = float(grasp.required_opening_m)
+-                # 手指沿接近走廊扫掠时必须让开物体：实测需要开度超过夹爪上限
+-                # 就没有接触余量（堵转夹爪会闭到头夹空）；超过回归宽度则下探
+-                # 途中就会撞上物体两侧。容差吸收深度噪声（±2~4mm）。
+-                if required > self.max_gripper_width - 0.002:
+-                    self._record_reject(
+-                        report, goal_handle, grasp, "aperture",
+-                        f"measured opening {required * 1000:.1f}mm leaves no contact margin "
+-                        f"within gripper max {self.max_gripper_width * 1000:.1f}mm",
+-                    )
++            for grasp_R, transit_R, kind in self._orientation_variants(transform):
++                if kind != 'graspnet':
+                     continue
+-                if required - grasp.width_m > self.aperture_tolerance_m:
+-                    self._record_reject(
+-                        report, goal_handle, grasp, "aperture",
+-                        f"measured opening {required * 1000:.1f}mm exceeds regressed width "
+-                        f"{grasp.width_m * 1000:.1f}mm (+{self.aperture_tolerance_m * 1000:.0f}mm tol)",
+-                    )
+-                    continue
++                native.append((grasp, transform, grasp_R, transit_R, 'native'))
++        derived = []
++        if self.allow_reachable_fallback or self.orientation_mode == 'template' or self.template_fallback:
++            center = np.asarray(centroid_locate(), dtype=float) if centroid_locate is not None else np.median(self.target_cloud, axis=0)
+             if center_band is not None:
+-                z_lo, z_hi = center_band
+-                margin = self.center_band_margin_m
+-                if (z_hi - z_lo) > 0.015:
+-                    zc = float(transform_base_grasp[2, 3])
+-                    if not (z_lo + margin <= zc <= z_hi - margin):
+-                        self._record_reject(
+-                            report, goal_handle, grasp, "center_band",
+-                            f"grasp center z={zc * 100:.1f}cm outside object band "
+-                            f"[{(z_lo + margin) * 100:.1f}, {(z_hi - margin) * 100:.1f}]cm",
+-                        )
++                lo, hi = center_band
++                table_top = float(self.table_center[2] + self.table_size[2]/2)
++                center[2] = max(table_top+0.006, lo+0.35*(hi-lo))
++            variants = self._template_orientation_variants(center)
++            # Add orientations along the target's observed principal axes so a
++            # long object can be grasped across its short side, independently
++            # of the arm's radial direction. Every pose is evaluated again.
++            xy = self.target_cloud[:, :2]
++            _, axes = np.linalg.eigh(np.cov(xy.T))
++            yaw = math.atan2(axes[1, 0], axes[0, 0])-math.pi/2
++            for pitch in self.reachability.order_pitches(self.pitch_ladder, *center):
++                for dy in (0.0, math.pi, math.radians(15), -math.radians(15)):
++                    variants.append((rpy_rotation(0, pitch, yaw+dy),
++                                     rpy_rotation(0, min(pitch, max(self.transit_pitches)), yaw+dy), 'geometric'))
++            reference = indexed[0][0] if indexed else RemoteGrasp(
++                index=4294967295, score=0.0, width_m=0.0,
++                height_m=self.gripper_geometry.finger_height, depth_m=0.01,
++                transform_camera_grasp=np.eye(4),
++            )
++            centers = [center]
++            if center_band is not None:
++                # Low grasps wrap deeply but can be below this arm's IK limit.
++                # Try modestly higher contact planes, each independently checked
++                # against the SAME target and physical jaw geometry.
++                for fraction in (0.55, 0.75):
++                    raised = center.copy()
++                    raised[2] = max(table_top+0.006, lo+fraction*(hi-lo))
++                    if np.linalg.norm(raised-center) > 0.002:
++                        centers.append(raised)
++            derived = [(reference, self._make_tf(np.eye(3), position), a, b, 'geometric')
++                       for a, b, _ in variants for position in centers]
++        quality_reports = []
++        try:
++            for phase, phase_deadline, proposals in (
++                ('native', native_deadline if derived else deadline, native),
++                ('geometric', deadline, derived),
++            ):
++                if goal_handle.is_cancel_requested:
++                    return None
++                evaluated = []
++                for proposal_index, (grasp, transform, grasp_R, transit_R, kind) in enumerate(proposals):
++                    if time.monotonic() >= deadline:
++                        break
++                    if kind == 'native':
++                        matrix = transform.copy()
++                        matrix[:3, :3] = grasp_R
++                        tool = graspnet_tool_transform(matrix, grasp.depth_m, self.transform_grasp_tool)
++                    else:
++                        tool = self._make_tf(grasp_R, transform[:3, 3]-grasp_R[:, 0]*self.gripper_geometry.tip_offset)
++                    tool = recenter_tool(self.target_cloud, tool, self.gripper_geometry,
++                                         max_shift=0.008 if kind == 'native' else 0.02)
++                    measure = assess_tool_grasp(self.target_cloud, self.scene_cloud, tool,
++                                               self.gripper_geometry, self.pregrasp_distance)
++                    if not measure['valid']:
++                        quality_reports.append({'index': grasp.index, 'kind': kind, 'tool': tool.tolist(), **measure})
+                         continue
+-            if self.orientation_mode == "graspnet" and approach_from_below(
+-                transform_base_grasp, self.max_approach_z
+-            ):
+-                self._record_reject(report, goal_handle, grasp, "approach",
+-                                    f"approach from below z={transform_base_grasp[2, 0]:.2f}")
+-                continue
+-            sources.append((grasp, transform_base_grasp, self._orientation_variants(transform_base_grasp)))
+-        if self.template_fallback and centroid_locate is not None:
+-            # 保底：链路全挂时用 /v1/locate 的物体质心 + 模板倾斜俯抓硬试，
+-            # 完全不依赖 GraspNet 的姿态输出。
+-            try:
+-                centroid = centroid_locate()
+-            except Exception as exc:
+-                centroid = None
+-                self.get_logger().warn(f"centroid fallback locate failed: {exc}")
+-            if centroid is not None:
+-                # 点云中位数偏顶部（俯视相机看到的上表面点多），质心 z 直接用会
+-                # 擦顶边（2026-10-02 方块：中位 2.4cm，真实带 0.6~3.3cm）。有
+-                # 波段时把兜底抓取中心压到带内偏下（lo + 40% 高度）。
+-                if center_band is not None:
+-                    z_lo, z_hi = center_band
+-                    height = z_hi - z_lo
+-                    if height > 0.02:
+-                        centroid[2] = min(
+-                            z_lo + 0.4 * height, z_hi - self.center_band_margin_m
+-                        )
+-                self.get_logger().warn(
+-                    "all GraspNet candidates failed; trying centroid template fallback at "
+-                    f"{np.asarray(centroid).round(3).tolist()}"
+-                )
+-                sources.append((None, self._make_tf(np.eye(3), centroid), self._template_orientation_variants(centroid)))
+-        for grasp, transform_base_grasp, variants in sources:
+-            failures: List[str] = []
+-            positions_outside: Optional[List[str]] = None
+-            orientation_count = 0
+-            label = f"#{grasp.index}" if grasp is not None else "centroid"
+-            ik_seeds = self._ik_joint_seeds(
+-                float(transform_base_grasp[0, 3]), float(transform_base_grasp[1, 3])
+-            )
+-            for grasp_R, transit_R, kind in variants:
+-                orientation_count += 1
+-                if self._budget_exhausted(deadline):
+-                    failures.append(f"BUDGET:已用满 {self.plan_budget_s:.0f}s 规划预算")
+-                    break
+-                if kind == "graspnet":
+-                    transform = np.eye(4)
+-                    transform[:3, :3] = grasp_R
+-                    transform[:3, 3] = transform_base_grasp[:3, 3]
++                    # A template is independently scored by geometry; never
++                    # carry the old neural score over to a different rotation.
++                    score = grasp.score if kind == 'native' else 0.0
++                    updated = replace(grasp, score=score,
++                                      width_m=measure['required_opening_m'],
++                                      required_opening_m=measure['required_opening_m'])
++                    tip = tool[:3, 3] + tool[:3, 0]*self.gripper_geometry.tip_offset
++                    table_top = float(self.table_center[2]+self.table_size[2]/2)
++                    if tip[2] < table_top+0.003:
++                        quality_reports.append({'index': grasp.index, 'kind': kind, 'valid': False, 'reason': 'tip_below_table'})
++                        continue
++                    # Construct approach waypoints around the already validated
++                    # ACTUAL tool pose, not around the discarded prediction.
+                     waypoints = candidate_waypoints(
+-                        transform,
+-                        self.transform_grasp_tool,
+-                        self.pregrasp_distance,
+-                        self.lift_distance,
+-                        self.retreat_distance,
+-                        transit_rotation=(
+-                            None if np.allclose(grasp_R, transit_R) else transit_R
+-                        ),
++                        tool, np.eye(4), self.pregrasp_distance, self.lift_distance,
++                        self.retreat_distance, transit_rotation=transit_R,
+                         max_pregrasp_z=self.max_pregrasp_z,
+                     )
+-                else:
+-                    waypoints = self._template_waypoints(
+-                        transform_base_grasp[:3, 3], grasp_R, transit_R
+-                    )
+-                outside = [
+-                    stage for stage, matrix in waypoints.items()
+-                    if not self._waypoint_in_bounds(stage, matrix[:3, 3])
+-                ]
+-                if outside:
+-                    positions_outside = outside
+-                    continue
+-                base_stages = ("pregrasp", "grasp", "lift")
+-                poses = [
+-                    (stage.upper(), self._pose_stamped(waypoints[stage], stamp))
+-                    for stage in base_stages
+-                ]
+-                all_waypoints = dict(waypoints)
+-                if place_target is not None:
+-                    # 放置点阶梯：精确点不可解时按网格就近偏移（±place_offset_search_m）
+-                    placed = False
+-                    for place_xyz in self._place_point_candidates(place_target):
+-                        built, updates = self._place_poses(
+-                            waypoints["lift"][2, 3], transit_R, place_xyz, stamp, failures
+-                        )
+-                        if built is None:
+-                            continue
+-                        all_waypoints.update(updates)
+-                        poses = poses + built
+-                        placed = True
++                    if any(not self._waypoint_in_bounds(stage, matrix[:3, 3]) for stage, matrix in waypoints.items()):
++                        continue
++                    # Small opening, central contact, then reachability order.
++                    # Native proposals remain in model score order.
++                    rank = (-score, measure['required_opening_m']) if kind == 'native' else (
++                        math.ceil(measure['required_opening_m']/0.01), proposal_index)
++                    evaluated.append((rank, updated, waypoints, measure))
++                if phase == 'geometric':
++                    evaluated.sort(key=lambda entry: entry[0])
++                for _, grasp, waypoints, measure in evaluated:
++                    if goal_handle.is_cancel_requested or time.monotonic() >= phase_deadline:
+                         break
+-                    if not placed:
+-                        continue
+-                else:
+-                    poses = poses + [
+-                        ("RETREAT", self._pose_stamped(waypoints["retreat"], stamp))
+-                    ]
+-                try:
+-                    dump_path = capture_directory / "ik_poses.json"
+-                    entries = json.loads(dump_path.read_text()) if dump_path.exists() else []
+-                    entries.append({
+-                        "label": label,
+-                        "score": None if grasp is None else grasp.score,
+-                        "orientation_index": orientation_count,
+-                        "kind": kind,
+-                        "has_place": place_target is not None,
+-                        "place_point": None if place_target is None else (
+-                            all_waypoints["place"][:3, 3].round(5).tolist()
+-                        ),
+-                        "poses": {
+-                            stage: [
+-                                p.pose.position.x, p.pose.position.y, p.pose.position.z,
+-                                p.pose.orientation.x, p.pose.orientation.y,
+-                                p.pose.orientation.z, p.pose.orientation.w,
+-                            ]
+-                            for stage, p in poses
+-                        },
+-                    })
+-                    dump_path.write_text(json.dumps(entries, indent=1) + "\n")
+-                except Exception:
+-                    pass
+-                if not plan_motion:
+-                    return grasp, all_waypoints, None
+-                ik_valid, reason = self.planner.validate_waypoint_ik(
+-                    poses, extra_joint_seeds=ik_seeds
+-                )
+-                if not ik_valid:
+-                    failures.append(f"IK:{reason}")
+-                    continue
+-                self.planner.default_joint_seeds = ik_seeds
+-                plan, reason = self.planner.plan_sequence(poses)
+-                if plan is None:
+-                    failures.append(f"PLAN:{reason}")
+-                    continue
+-                if kind in {"reachable", "template"} and grasp is not None:
+-                    self.get_logger().info(
+-                        f"using {kind} orientation fallback for grasp #{grasp.index} "
+-                        f"score={grasp.score:.3f}"
+-                    )
+-                if grasp is None:
+-                    self.get_logger().warn(
+-                        f"using centroid template fallback ({kind}) at "
+-                        f"{transform_base_grasp[:3, 3].round(3).tolist()}"
+-                    )
+-                if self.planner.last_solution_seed is not None:
+-                    self.last_successful_seed = list(self.planner.last_solution_seed)
+-                return grasp, all_waypoints, plan
+-            if positions_outside:
+-                self._record_reject(
+-                    report, goal_handle, grasp, "workspace",
+-                    ",".join(positions_outside), occupied="workspace",
+-                )
+-            else:
+-                unique_reasons = list(dict.fromkeys(failures))[:3]
+-                self._record_reject(
+-                    report, goal_handle, grasp,
+-                    f"{orientation_count} orientations failed",
+-                    "; ".join(unique_reasons) if unique_reasons else "unknown",
+-                )
+-            continue
++                    self.planner.deadline = phase_deadline
++                    seeds = self._ik_joint_seeds(*waypoints['grasp'][:2, 3])
++                    self.planner.default_joint_seeds = seeds
++                    places = self._place_point_candidates(place_target) if place_target is not None else [None]
++                    for place_xyz in places:
++                        if time.monotonic() >= phase_deadline:
++                            break
++                        all_waypoints = dict(waypoints)
++                        poses = [(s.upper(), self._pose_stamped(waypoints[s], stamp))
++                                 for s in ('pregrasp', 'grasp', 'lift')]
++                        if place_xyz is not None:
++                            # Each place pitch is tried through IK AND planning;
++                            # previously the first in-bounds pitch hid the rest.
++                            place_variants = self._place_pose_variants(
++                                waypoints['lift'][2, 3], waypoints['lift'][:3, :3], place_xyz, stamp)
++                        else:
++                            place_variants = [([('RETREAT', self._pose_stamped(waypoints['retreat'], stamp))], {})]
++                        for extra_poses, extra_waypoints in place_variants:
++                            if time.monotonic() >= phase_deadline:
++                                break
++                            plan_poses = poses + extra_poses
++                            all_waypoints.update(extra_waypoints)
++                            plan, reason = self.planner.plan_sequence(plan_poses) if plan_motion else (None, '')
++                            if plan_motion and plan is None:
++                                self._record_reject(report, goal_handle, grasp, phase+'_plan', reason)
++                                continue
++                            self.selection_kind = phase
++                            selected_report = {'kind': phase, 'index': grasp.index, 'score': grasp.score,
++                                               'tool0': waypoints['grasp'].tolist(), **measure}
++                            if capture_directory is not None:
++                                (capture_directory/'selected_grasp.json').write_text(json.dumps(selected_report, indent=2)+'\n')
++                            self._feedback(goal_handle, 'SELECTED_'+phase.upper(), grasp.index,
++                                           f"opening={grasp.width_m*1000:.1f}mm contacts={measure['contact_points']}")
++                            if self.planner.last_solution_seed is not None:
++                                self.last_successful_seed = list(self.planner.last_solution_seed)
++                            return grasp, all_waypoints, plan
++            self._record_reject(report, goal_handle, None, 'geometry_or_budget',
++                                f'{len(quality_reports)} poses rejected by target/scene geometry; planning budget {self.plan_budget_s}s')
++            return None
++        finally:
++            self.planner.deadline = None
++            if capture_directory is not None:
++                (capture_directory/'grasp_quality.json').write_text(json.dumps(quality_reports, indent=2)+'\n')
++
+ 
+     def _budget_exhausted(self, deadline: float) -> bool:
+         return time.monotonic() > deadline
+@@ -1573,7 +1522,7 @@
+
+         occupied: str = "",
+     ) -> None:
+         """记录并上报一次候选/姿态拒绝：feedback 给实时反馈，report 给最终错误信息。"""
+-        index = int(grasp.index) if grasp is not None else -1
++        index = int(grasp.index) if grasp is not None else 4294967295
+         self._feedback(goal_handle, "CANDIDATE_REJECT", index, f"{reason}: {detail}")
+         if report is None:
+             return
+@@ -1670,6 +1619,11 @@
+
+         failures: List[str],
+     ) -> Tuple[Optional[List[Tuple[str, PoseStamped]]], Dict[str, np.ndarray]]:
+         """TRANSPORT/PLACE/RETREAT 三段位姿；放置姿态也走可达性排序的 pitch 阶梯。"""
++        for built, updates in self._place_pose_variants(lift_z, transit_R, place_xyz, stamp):
++            return built, updates
++        return None, {}
++
++    def _place_pose_variants(self, lift_z, transit_R, place_xyz, stamp):
+         px, py, pz = (float(v) for v in place_xyz)
+         yaw_p = math.atan2(py, px)
+         for place_pitch in self.reachability.order_pitches(self.place_pitches, px, py, pz):
+@@ -1685,14 +1639,12 @@
+
+                 if not self._in_workspace_place(matrix[:3, 3])
+             ]
+             if outside:
+-                failures.append(f"PLACE_WS:p{place_pitch:.2f}:{','.join(outside)}")
+                 continue
+             poses = [
+                 (name.upper(), self._pose_stamped(matrix, stamp))
+                 for name, matrix in waypoints.items()
+             ]
+-            return poses, waypoints
+-        return None, {}
++            yield poses, waypoints
+ 
+     @staticmethod
+     def _rpy_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:

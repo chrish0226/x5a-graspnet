@@ -1,0 +1,105 @@
+{
+  "capture": "20261003_170536_818755",
+  "proposals": 112,
+  "target_points": 2784,
+  "scene_voxels": 28803,
+  "controller_actions_sent": 0,
+  "results": [
+    {
+      "prepared_scene": false,
+      "workers": 1,
+      "median_s": 1.39771,
+      "runs_s": [
+        1.4252,
+        1.40106,
+        1.39436,
+        1.38891
+      ],
+      "identical_to_original": true
+    },
+    {
+      "prepared_scene": false,
+      "workers": 2,
+      "median_s": 1.3045,
+      "runs_s": [
+        1.29518,
+        1.31743,
+        1.2907,
+        1.31382
+      ],
+      "identical_to_original": true
+    },
+    {
+      "prepared_scene": false,
+      "workers": 4,
+      "median_s": 1.38039,
+      "runs_s": [
+        1.25899,
+        1.3827,
+        1.37808,
+        1.38875
+      ],
+      "identical_to_original": true
+    },
+    {
+      "prepared_scene": false,
+      "workers": 8,
+      "median_s": 1.42405,
+      "runs_s": [
+        1.4334,
+        1.42463,
+        1.42348,
+        1.41254
+      ],
+      "identical_to_original": true
+    },
+    {
+      "prepared_scene": true,
+      "workers": 1,
+      "median_s": 0.09752,
+      "runs_s": [
+        0.09777,
+        0.09457,
+        0.09728,
+        0.09881
+      ],
+      "identical_to_original": true
+    },
+    {
+      "prepared_scene": true,
+      "workers": 2,
+      "median_s": 0.08104,
+      "runs_s": [
+        0.07396,
+        0.08132,
+        0.08098,
+        0.08109
+      ],
+      "identical_to_original": true
+    },
+    {
+      "prepared_scene": true,
+      "workers": 4,
+      "median_s": 0.09408,
+      "runs_s": [
+        0.08873,
+        0.097,
+        0.09382,
+        0.09434
+      ],
+      "identical_to_original": true
+    },
+    {
+      "prepared_scene": true,
+      "workers": 8,
+      "median_s": 0.10449,
+      "runs_s": [
+        0.10249,
+        0.10991,
+        0.10358,
+        0.10539
+      ],
+      "identical_to_original": true
+    }
+  ]
+}

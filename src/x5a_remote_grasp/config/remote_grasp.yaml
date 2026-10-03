@@ -1,0 +1,174 @@
+/**:
+  ros__parameters:
+    remote:
+      base_url: http://118.253.179.80:8300
+      api_key_env: SAM_GRASPNET_API_KEY
+      connect_timeout_s: 3.0
+      inference_timeout_s: 120.0
+      threshold: 0.45
+      mask_dilation_px: 2
+      num_point: 20000
+      top_k_default: 20
+      top_k_max: 40
+      collision_thresh: 0.01
+      voxel_size: 0.005
+      target_distance_thresh: 0.006
+    topics:
+      color: /camera/camera/color/image_raw
+      aligned_depth: /camera/camera/aligned_depth_to_color/image_raw
+      camera_info: /camera/camera/color/camera_info
+    sync:
+      queue_size: 10
+      slop_s: 0.06
+      max_stamp_delta_s: 0.08
+      max_frame_age_s: 1.0
+    depth:
+      camera_node: /camera/camera
+      units_parameter: depth_module.depth_units
+      scale_m_per_unit_override: 0.0
+      allow_32fc1_reencode: false
+      min_m_default: 0.10
+      max_m_default: 1.50
+    frames:
+      base: base_link
+      tf_timeout_s: 0.5
+      max_tf_stamp_delta_s: 0.10
+    workspace:
+      x_min: 0.08
+      x_max: 0.41
+      y_min: 0.08
+      y_max: 0.48
+      z_min: -0.005
+      z_max: 0.50
+      r_max: 0.54
+      table_clearance_m: 0.005
+    gripper:
+      max_width_m: 0.088
+      width_margin_m: 0.006
+      width_to_finger_ratio: 0.5
+      joint_names: [joint7, joint8]
+    grasp:
+      # GraspNet official convention: rotation column 0 (+X) is approach,
+      # column 1 (+Y) points between the jaws, and +Z is orthogonal.
+      approach_axis: x
+      # Short approach: a 0.10 m top-down pregrasp puts tool0 near z=0.15,
+      # where X5A has no IK for a steep tool. 0.05 m stays under ~0.11 m.
+      pregrasp_distance_m: 0.05
+      lift_distance_m: 0.08
+      retreat_distance_m: 0.08
+      max_pregrasp_z: 0.11
+      # graspnet: use the predicted 6D pose (bottles, side grasps, top-downs).
+      # template: legacy near-vertical cube family; keep as an override only.
+      orientation_mode: graspnet
+      template_rpy: [0.0, 1.45, 0.0]
+      # 恢复实机抓取成功时的有效抓取参考偏移 15mm。
+      # CAD 指尖距离 44.8mm 不能直接替代抓取参考点/TCP 的实机标定。
+      # 原生 GraspNet 另加每个候选的 depth_m，不能用固定偏移代替。
+      tcp_backoff_m: 0.015
+      template_pregrasp_distance_m: 0.04
+      # 放置工具参考高度下限；抓取另检查实际指尖和场景碰撞。
+      min_tool0_height_m: 0.02
+      transit_pitches: [1.15, 0.90]
+      place_pitches: [1.45, 1.15, 0.90, 0.75]
+      # 物体底部在目标顶面上方 1~2cm 松爪；优先最低无碰撞高度。
+      # 保持物体中心与朝向，完整检查下降、开爪状态与撤退路径。
+      place_release_clearances_m: [0.010, 0.015, 0.018, 0.020]
+      # 兼容旧配置；实际标定使用 transform_grasp_tool_translation。
+      approach_offset_m: 0.0
+      # Reject grasps whose +X points too far upward (gripper under the table).
+      max_approach_z: 0.35
+      # 原生姿态规划失败后，重新生成并验证目标接触和场景碰撞。
+      allow_reachable_fallback: true
+      # 可解性阶梯：姿态按实测可达性表排序（表不存在时按 z 的经验规律），逐个
+      # 降级硬试。pitch 越小工具越斜：1.45 竖直只在低处可解，高处必须用
+      # 0.90/0.75；yaw 是相对「朝向机械臂」的偏角，换个来向绕开不可达分支。
+      pitch_ladder: [1.45, 1.15, 0.90, 0.75]
+      yaw_ladder_deg: [0, 45, -45, 180]
+      # 低于此分数的 GraspNet 候选直接跳过（0 = 全都试）。
+      min_score: 0.15
+      # 原生阶段后允许独立几何候选；其分数不沿用神经网络分数。
+      template_fallback: true
+      # 放置点不可解时，以分割中心为圆心在这个半径内按网格就近偏移，
+      # 找到第一个可解的点就放上去；全失败则明确报错并提示「放下」。
+      place_offset_search_m: 0.03
+      place_offset_step_m: 0.015
+      place_offset_max_points: 9
+      # T_grasp_tool0. Identity rotation is the URDF mapping:
+      # tool0 +X = finger/approach, tool0 +Y = jaw opening = GraspNet +Y.
+      # GraspNet path: this is the physical tip calibration only. The planner
+      # adds each candidate depth_m along +X before mapping to tool0.
+      transform_grasp_tool_translation: [-0.015, 0.0, 0.0]
+      transform_grasp_tool_rotation: [1.0, 0.0, 0.0,
+                                      0.0, 1.0, 0.0,
+                                      0.0, 0.0, 1.0]
+      # 有效抓取参考模型；整体手指碰撞另由 MoveIt URDF/STL 检查。
+      # 改动该值必须经过实机接触深度标定，不能单凭 CAD 尺寸替换。
+      tip_offset_m: 0.015
+      finger_length_m: 0.10
+      finger_thickness_m: 0.01
+      finger_height_m: 0.02
+      pad_length_m: 0.03
+      native_budget_fraction: 0.45
+      max_target_motion_m: 0.01
+      max_capture_to_execute_s: 60.0
+      # Geometric contact checks replace the old camera-Z-band heuristic.
+      center_band_enabled: false
+    poses:
+      ready_joints: [0.72, 0.85, 0.95, -0.55, 0.0, 0.0]
+      # 抓取成功后带着物体停到这里等下一句指令（面向固定相机，手臂和手里的
+      # 物体不会挡住后续 /v1/locate 的视野）。
+      hold_joints: [0.72, 0.85, 0.95, -0.55, 0.0, 0.0]
+    interaction:
+      # 抓取成功后自动移到 poses.hold_joints 等待下一句指令
+      carry_to_ready: true
+    safety:
+      plan_only: true
+      tcp_mapping_confirmed: true
+      require_table_collision: true
+      require_camera_collision: true
+    planning:
+      enabled: true
+      group: arm
+      tcp_frame: tool0
+      move_group_action: /move_action
+      compute_ik_service: /compute_ik
+      state_validity_service: /check_state_validity
+      apply_scene_service: /apply_planning_scene
+      allowed_time_s: 5.0
+      result_timeout_s: 30.0
+      ik_timeout_s: 0.15
+      attempts: 4
+      velocity_scaling: 0.10
+      acceleration_scaling: 0.10
+      position_tolerance_m: 0.003
+      orientation_tolerance_rad: 0.05
+      cartesian_step: 0.003
+      min_cartesian_fraction: 0.9999
+      # 单次抓取/放置的目标规划总预算：用满就停止并报出已试多少候选/姿态、
+      # 卡在哪一段，避免交互被无止境的硬试拖死。
+      total_budget_s: 30.0
+      # 仅并行纯点云检查；按原候选顺序消费结果，IK/轨迹/发布仍串行。
+      # 实测本机 2 个工作线程收益最佳；1 可关闭并行，最多 4。
+      geometry_workers: 2
+      parallel_ik_service: /x5a_parallel_ik/solve
+      parallel_ik_workers: 4
+      # 服务缺失时可回退原串行 IK；模型/场景校验错误必须停止。
+      parallel_ik_fallback_serial: true
+      # 实测可达性表（scripts/probe_reachability.sh 生成）；不存在则退回经验规律。
+      reachability_table: /home/quella/.local/share/x5a_remote_grasp/reachability.json
+    scene:
+      table_center: [0.25, 0.30, -0.026]
+      table_size: [0.52, 0.72, 0.04]
+      camera_size: [0.10, 0.05, 0.05]
+      camera_center_in_camera_link: [0.0, 0.0, 0.0]
+      camera_frame: camera_link
+    markers:
+      topic: /x5a_remote_grasp/candidates
+      axis_length_m: 0.06
+      axis_diameter_m: 0.006
+      lifetime_s: 60.0
+    capture:
+      directory: /home/quella/.local/share/x5a_remote_grasp/captures
+    action_name: /x5a_remote_grasp/plan
+    health_service: /x5a_remote_grasp/health
+    save_snapshot_service: /x5a_remote_grasp/save_snapshot

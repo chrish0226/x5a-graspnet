@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>x5a_parallel_ik</name>
+  <version>0.1.0</version>
+  <description>Independent, collision-aware IK workers. No robot execution interfaces.</description>
+  <maintainer email="user@example.com">x5a user</maintainer>
+  <license>BSD-3-Clause</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>moveit_core</depend>
+  <depend>moveit_ros_planning</depend>
+  <depend>moveit_msgs</depend>
+  <depend>tf2_eigen</depend>
+  <depend>std_srvs</depend>
+  <depend>x5a_task_interfaces</depend>
+  <depend>openssl</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

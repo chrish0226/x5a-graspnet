@@ -1,0 +1,26 @@
+{
+ "place_prompt": "white cube",
+ "place_rel": "on",
+ "center_cam": [
+  0.0749,
+  -0.0325,
+  0.479
+ ],
+ "top_cam": [
+  0.0749,
+  -0.0325,
+  0.496
+ ],
+ "center_base": [
+  0.22079,
+  0.30275,
+  0.02169
+ ],
+ "z_top_base": 0.03438,
+ "place_point_base": [
+  0.22094,
+  0.30282,
+  0.03327
+ ],
+ "point_semantics": "object_bottom_support_surface"
+}

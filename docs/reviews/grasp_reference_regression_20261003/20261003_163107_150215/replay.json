@@ -1,0 +1,63 @@
+{
+  "capture": "20261003_163107_150215",
+  "plan_only": true,
+  "controller_actions_sent": 0,
+  "reference_offset_m": 0.015,
+  "selected": true,
+  "elapsed_s": 1.403,
+  "failures": [
+    {
+      "index": 1,
+      "score": 0.144,
+      "reason": "score_or_approach",
+      "detail": "native candidate rejected"
+    },
+    {
+      "index": 2,
+      "score": 0.1402,
+      "reason": "score_or_approach",
+      "detail": "native candidate rejected"
+    },
+    {
+      "index": 3,
+      "score": 0.1132,
+      "reason": "score_or_approach",
+      "detail": "native candidate rejected"
+    }
+  ],
+  "stages": [
+    "PREGRASP",
+    "GRASP",
+    "LIFT",
+    "RETREAT"
+  ],
+  "selected_tool0": [
+    [
+      -0.05162200906853126,
+      -0.9035946176045513,
+      -0.42526689880099205,
+      0.09858005133318759
+    ],
+    [
+      0.10888565380679507,
+      -0.4283885701510776,
+      0.8970101155276801,
+      0.2657803305448811
+    ],
+    [
+      -0.9927129910375885,
+      0.0,
+      0.12050276936736662,
+      0.04407703035540969
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "previous_tool_height_m": 0.06844371613887046,
+  "corrected_tool_height_m": 0.04407703035540969,
+  "required_opening_m": 0.026378626694298003
+}

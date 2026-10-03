@@ -9,6 +9,7 @@
   const resultText = $("resultText");
   const linkBadge = $("linkBadge");
   const busyBadge = $("busyBadge");
+  const holdingBadge = $("holdingBadge");
   const speechWarn = $("speechWarn");
   const speechStatus = $("speechStatus");
   const talkHint = $("talkHint");
@@ -104,11 +105,24 @@
     ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
   }
 
+  function applyHolding(holding, heldObject) {
+    if (!holdingBadge) return;
+    if (holding) {
+      const label = (heldObject && heldObject.label) || "物体";
+      holdingBadge.textContent = `拿着${label}`;
+      holdingBadge.className = "pill busy";
+    } else {
+      holdingBadge.textContent = "空手";
+      holdingBadge.className = "pill";
+    }
+  }
+
   function applyState(state) {
     if (state.transcript && !holding) transcriptEl.textContent = state.transcript;
     if (state.parsed) parsedEl.textContent = JSON.stringify(state.parsed, null, 2);
     if (state.stage) stageCode.textContent = state.stage;
     if (state.stage_zh) stageText.textContent = state.stage_zh;
+    if (state.holding !== undefined) applyHolding(state.holding, state.held_object);
     const terminal = ["SUCCESS", "FAILED", "IDLE", "DRY_RUN"].indexOf(state.stage) >= 0;
     const busy = !terminal && (Boolean(state.busy) || state.robot_state === "BUSY");
     busyBadge.textContent = busy ? "忙碌" : "空闲";
@@ -351,6 +365,14 @@
       const color = btn.getAttribute("data-color");
       transcriptEl.textContent = `手动：${color}`;
       send({ type: "manual_task", action: "pick_place", target_color: color });
+    });
+  });
+
+  document.querySelectorAll("[data-command]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const command = btn.getAttribute("data-command");
+      transcriptEl.textContent = `手动：${command}`;
+      sendText(command);
     });
   });
 

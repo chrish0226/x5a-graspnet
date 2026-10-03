@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 
 ALLOWED_ACTIONS = frozenset({"pick_place", "unknown", "cancel", "sequence"})
@@ -54,6 +54,127 @@ PICK_HINTS = (
 )
 
 STOP_HINTS = ("停止", "停下", "取消", "别抓", "不要动", "急停", "stop", "cancel")
+
+# ---------------------------------------------------------------------------
+# 后续指令（多轮交互）：云端 /parse 是无状态的，"放到白色方块上" 在那里和
+# "抓白色方块" 长得一样，所以放置/放下意图必须在本地判定。
+# ---------------------------------------------------------------------------
+PLACE_VERBS = (
+    "放到", "放在", "放进", "搁在", "搁到", "摆在", "摆到", "扔进", "扔到",
+    "塞进", "装进", "移到", "挪到", "put", "place",
+)
+GRASP_VERBS = (
+    "抓", "拿", "取", "夹", "捡", "挑", "搬", "拾", "握", "捏",
+    "pick", "grasp", "grab",
+)
+RELEASE_VERBS = (
+    "放下", "松开", "松手", "撒手", "放手", "丢掉", "扔掉", "放掉", "释放",
+    "release", "drop",
+)
+RELATION_IN_HINTS = ("里面", "里边", "里头", "内部", "里", "中", "内")
+RELATION_ON_HINTS = ("上面", "上边", "上头", "顶部", "顶上", "上", "on", "onto")
+# 抽取名词短语时要去掉的尾缀（关系词、语气词、标点）
+_TRAILING_NOISE = (
+    "上面", "上边", "上头", "顶部", "顶上", "里面", "里边", "里头", "内部",
+    "一下", "那儿", "那里", "这里", "去", "吧", "呢", "啊", "上", "里", "中",
+    "内", "的",
+    "。", "，", "！", "？", "!", "?", ".", ",",
+)
+
+
+def _tail_after(text: str, markers: Sequence[str]) -> Optional[str]:
+    """第一个 marker 之后的部分（用于取放置目标名词短语）。"""
+    position = -1
+    for marker in markers:
+        found = text.find(marker)
+        if found >= 0 and (position < 0 or found + len(marker) < position):
+            position = found + len(marker)
+    return None if position < 0 else text[position:]
+
+
+def _head_before(text: str, markers: Sequence[str]) -> str:
+    """第一个 marker 之前的部分（动词前的宾语短语）。"""
+    position = -1
+    for marker in markers:
+        found = text.find(marker)
+        if found >= 0 and (position < 0 or found < position):
+            position = found
+    return "" if position < 0 else text[:position]
+
+
+# 动词前只出现这些词时，说明那句话没有点名「要抓什么」，是接着上一步的后续指令
+_PRE_VERB_FUNCTION_WORDS = (
+    "把那个", "把那", "把这个", "把这", "帮我", "帮忙", "给我", "请", "把",
+    "将", "你", "它", "他", "那个", "这个", "再", "接着", "然后", "先", "给",
+)
+
+
+def _names_a_grasp_target(pre_verb: str) -> bool:
+    """动词前是否点了具体物体名（点了 = 完整的一步任务，不是后续指令）。"""
+    cleaned = pre_verb.strip()
+    changed = True
+    while changed and cleaned:
+        changed = False
+        for word in _PRE_VERB_FUNCTION_WORDS:
+            if cleaned.startswith(word):
+                cleaned = cleaned[len(word):].strip()
+                changed = True
+                break
+            if cleaned.endswith(word):
+                cleaned = cleaned[: -len(word)].strip()
+                changed = True
+                break
+    return len(cleaned) >= 2
+
+
+def _strip_trailing_noise(text: str) -> str:
+    cleaned = text.strip()
+    changed = True
+    while changed and cleaned:
+        changed = False
+        for noise in _TRAILING_NOISE:
+            if cleaned.endswith(noise) and len(cleaned) > len(noise):
+                cleaned = cleaned[: -len(noise)].strip()
+                changed = True
+                break
+    return cleaned.strip()
+
+
+def follow_up_intent(text: str) -> Optional[Dict[str, Any]]:
+    """判定「接着上一步动作」的后续指令；不是后续指令返回 None。
+
+    返回 {"action": "release"}，或
+         {"action": "remote_place", "target_text": 名词短语, "relation": "on"|"in"}。
+
+    规则刻意做成纯本地、可预测：含放置动词且不含抓取动词、且动词前没有点名
+    要抓的物体 = 放置后续指令（否则云端会把「放到白色方块上」理解成「抓白色
+    方块」）。像「把红色方块放到盒子里」那样点名了物体的，仍交给云端当一步
+    任务处理；此时若手上还拿着东西，app 会拒绝并提示先说「放下」。
+    """
+    compact = _normalize(text)
+    if not compact:
+        return None
+    has_place_verb = any(hint in compact for hint in PLACE_VERBS)
+    if any(hint in compact for hint in RELEASE_VERBS) and not has_place_verb:
+        return {"action": "release", "source": "rule"}
+    if not has_place_verb:
+        return None
+    if any(hint in compact for hint in GRASP_VERBS):
+        return None
+    if _names_a_grasp_target(_head_before(compact, PLACE_VERBS)):
+        return None
+    tail = _tail_after(compact, PLACE_VERBS) or ""
+    relation = "on"
+    if any(hint in tail for hint in RELATION_IN_HINTS):
+        relation = "in"
+    elif any(hint in tail for hint in RELATION_ON_HINTS):
+        relation = "on"
+    return {
+        "action": "remote_place",
+        "target_text": _strip_trailing_noise(tail),
+        "relation": relation,
+        "source": "rule",
+    }
 
 SEQUENCE_HINTS = (
     "先", "再", "然后", "接着", "之后", "和", "跟", "以及", "还有", "与",

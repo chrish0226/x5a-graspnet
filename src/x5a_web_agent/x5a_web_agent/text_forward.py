@@ -15,7 +15,9 @@ def forward_url() -> str:
 
 
 def enabled() -> bool:
-    if os.environ.get("X5A_TEXT_FORWARD", "1") in {"0", "false", "FALSE", "no"}:
+    # 默认关闭：不再等待数字人服务器返回才允许机械臂动作。
+    # 需要联动时显式设置 X5A_TEXT_FORWARD=1。
+    if os.environ.get("X5A_TEXT_FORWARD", "0") in {"0", "false", "FALSE", "no"}:
         return False
     return bool(forward_url())
 

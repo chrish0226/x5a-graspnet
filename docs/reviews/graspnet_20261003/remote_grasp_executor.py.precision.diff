@@ -1,0 +1,230 @@
+--- /tmp/x5a_grasp_precision_before_20261003/src/x5a_remote_grasp/x5a_remote_grasp/remote_grasp_executor.py
+
++++ src/x5a_remote_grasp/x5a_remote_grasp/remote_grasp_executor.py
+
+@@ -33,6 +33,7 @@
+
+ import json
+ import threading
+ import time
++import numpy as np
+ from functools import wraps
+ from typing import Dict, List, Tuple
+ 
+@@ -47,9 +48,12 @@
+
+ from moveit_msgs.msg import DisplayTrajectory
+ from sensor_msgs.msg import JointState
+ from std_srvs.srv import Trigger
++from tf2_ros import Buffer, TransformListener
++from rclpy.time import Time
+ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+ 
+ from x5a_remote_grasp.moveit_plan import DISPLAY_MODEL_ID
++from x5a_remote_grasp.grasp_quality import held_from_gap, trajectory_fingerprint
+ 
+ # 段名由规划器的 poses 列表决定：抓取=4、抓取+放置=6、纯放置=3。
+ STAGE_TABLE = {
+@@ -89,7 +93,10 @@
+
+     def __init__(self) -> None:
+         super().__init__("x5a_remote_grasp_executor")
+         self.declare_parameter("execution.enabled", False)
+-        self.declare_parameter("execution.plan_max_age_s", 180.0)
++        self.declare_parameter("execution.plan_max_age_s", 30.0)
++        self.declare_parameter('execution.grasp_position_tolerance_m', 0.007)
++        self.declare_parameter('execution.grasp_angle_tolerance_rad', 0.12)
++        self.declare_parameter('execution.min_held_gap_m', 0.004)
+         self.declare_parameter("execution.open_width_m", 0.044)
+         self.declare_parameter("execution.close_width_m", 0.0)
+         self.declare_parameter("execution.trajectory_timeout_s", 40.0)
+@@ -103,6 +110,9 @@
+
+         self.declare_parameter("topics.display_path", "/display_planned_path")
+         self.enabled = bool(self.get_parameter("execution.enabled").value)
+         self.plan_max_age = float(self.get_parameter("execution.plan_max_age_s").value)
++        self.grasp_position_tolerance = float(self.get_parameter('execution.grasp_position_tolerance_m').value)
++        self.grasp_angle_tolerance = float(self.get_parameter('execution.grasp_angle_tolerance_rad').value)
++        self.min_held_gap = float(self.get_parameter('execution.min_held_gap_m').value)
+         self.open_width = float(self.get_parameter("execution.open_width_m").value)
+         self.close_width = float(self.get_parameter("execution.close_width_m").value)
+         self.traj_timeout = float(self.get_parameter("execution.trajectory_timeout_s").value)
+@@ -119,6 +129,11 @@
+
+         self.latest_plan = None
+         self.latest_plan_time = 0.0
+         self.latest_joints = None
++        self.joints_monotonic = 0.0
++        self.holding_state = 'unknown'
++        self.validated_tool = None
++        self.tf_buffer = Buffer()
++        self.tf_listener = TransformListener(self.tf_buffer, self)
+         self.running = False
+         # 夹爪里是否有物体：抓取计划合爪后置位，放置/放下后清零。
+         # agent 的会话状态以此为准（重启 agent 后可用 executor_state 重新对齐）。
+@@ -135,6 +150,7 @@
+
+         )
+         self.fjt_client = ActionClient(self, FollowJointTrajectory, fjt_name)
+         self.gripper_client = ActionClient(self, GripperCommand, gripper_name)
++        self.validation_client = self.create_client(Trigger, '/x5a_remote_grasp/validate_latest', callback_group=cb)
+         self.execute_srv = self.create_service(
+             Trigger, "/x5a_remote_grasp/execute", self._on_execute, callback_group=cb
+         )
+@@ -195,6 +211,34 @@
+
+ 
+     def _on_joints(self, msg) -> None:
+         self.latest_joints = (list(msg.name), list(msg.position))
++        self.joints_monotonic = time.monotonic()
++
++    def _holding_observation(self):
++        if self.latest_joints is None:
++            return 'unknown'
++        names, positions = self.latest_joints
++        try:
++            gap = float(positions[names.index('joint7')]+positions[names.index('joint8')])
++        except (ValueError, IndexError):
++            return 'unknown'
++        return held_from_gap(gap, time.monotonic()-self.joints_monotonic < 0.5, self.min_held_gap)
++
++    def _verify_grasp_pose(self):
++        if self.validated_tool is None:
++            raise RuntimeError('抓取缺少经验证的 TCP 目标')
++        from x5a_remote_grasp.geometry import transform_from_xyz_quat
++        actual = self.tf_buffer.lookup_transform('base_link', 'tool0', Time())
++        stamp = actual.header.stamp
++        age = (self.get_clock().now().nanoseconds/1e9)-(stamp.sec+stamp.nanosec/1e9)
++        if age > 0.5:
++            raise RuntimeError('实际 TCP 状态已过期')
++        p, q = actual.transform.translation, actual.transform.rotation
++        matrix = transform_from_xyz_quat([p.x, p.y, p.z], [q.x, q.y, q.z, q.w])
++        target = np.asarray(self.validated_tool)
++        position = float(np.linalg.norm(matrix[:3, 3]-target[:3, 3]))
++        angle = float(np.arccos(np.clip((np.trace(matrix[:3, :3].T@target[:3, :3])-1)/2, -1, 1)))
++        if position > self.grasp_position_tolerance or angle > self.grasp_angle_tolerance:
++            raise RuntimeError(f'实际抓取点误差 {position*1000:.1f}mm/{np.degrees(angle):.1f}度，未合爪')
+ 
+     @staticmethod
+     def _stage_names(plan: DisplayTrajectory) -> List[str]:
+@@ -272,8 +316,11 @@
+
+             })
+             return response
+         timeout = self.traj_timeout * max(1, len(stages)) + 30.0
++        plan = self.latest_plan
++        # Run preflight inside the worker (running is set first), so another
++        # execute/release cannot interleave with the perception check.
+         return self._block_until_done(
+-            threading.Thread(target=self._run, args=(self.latest_plan, stages), daemon=True),
++            threading.Thread(target=self._run, args=(plan, stages), daemon=True),
+             timeout,
+             response,
+         )
+@@ -296,6 +343,7 @@
+
+         ok = self._gripper(self.open_width, 3.0)
+         if ok:
+             self.holding = False
++            self.holding_state = 'empty'
+             self.get_logger().info("released: gripper opened in place")
+         response.success = bool(ok)
+         response.message = self._json({
+@@ -337,6 +385,7 @@
+
+             "enabled": self.enabled,
+             "running": self.running,
+             "holding": self.holding,
++            "holding_state": self.holding_state,
+             "plan_age_s": plan_age,
+             "plan_stages": [] if self.latest_plan is None else self._stage_names(self.latest_plan),
+         })
+@@ -407,17 +456,27 @@
+
+     def _run(self, plan: DisplayTrajectory, stages: List[str]) -> None:
+         outcome: Dict[str, object] = {"ok": False, "stage": "FAILED", "message": ""}
+         try:
++            if not self.validation_client.wait_for_service(timeout_sec=2.0):
++                raise RuntimeError('执行前感知复核服务未就绪')
++            future = self.validation_client.call_async(Trigger.Request())
++            if not self._wait_future(future, 35.0):
++                raise RuntimeError('执行前目标复核超时')
++            validation = future.result()
++            if validation is None or not validation.success:
++                raise RuntimeError('执行前复核失败: '+('无响应' if validation is None else validation.message))
++            checked = json.loads(validation.message)
++            if checked.get('plan_fingerprint') != trajectory_fingerprint(plan.trajectory):
++                raise RuntimeError('规划已经更换，请重新执行最新规划')
++            self.validated_tool = checked.get('tool')
++            self.latest_plan = None  # consumed plans cannot accidentally rerun
+             grasp_stages = [name for name in stages if name in GRASP_STAGES]
+             if grasp_stages:
+-                # 抓取计划：先张开夹爪清空（若本来就夹着东西，会当场放下——agent
+-                # 在持物时拒绝新的抓取指令，这里只是最后一道保险）。
+                 if self.holding:
+-                    self.get_logger().warn(
+-                        "grasp plan while still holding an object; opening gripper first"
+-                    )
++                    raise RuntimeError('仍在持物，拒绝执行新的抓取计划')
+                 if not self._gripper(self.open_width, 2.0):
+                     raise RuntimeError("打开夹爪失败")
+                 self.holding = False
++                self.holding_state = 'empty'
+             elif not self.holding:
+                 self.get_logger().warn(
+                     "place-only plan but the gripper is not marked as holding; "
+@@ -428,32 +487,26 @@
+
+                 self.get_logger().info(f"executing {stage} ({index + 1}/{len(stages)})")
+                 ok, code = self._follow(trajectory.joint_trajectory)
+                 if not ok:
+-                    if stage == "PLACE" and code == -4:
+-                        # adapter 保护停止(-4) = 下探接触到桌面：视为已到位，张爪释放后撤退
+-                        self.get_logger().info(
+-                            "PLACE 下降触发接触停止，视为已到达底部，张开夹爪释放"
+-                        )
+-                        if not self._gripper(self.open_width, 3.0):
+-                            raise RuntimeError("接触停止后张开夹爪失败")
+-                        self.holding = False
+-                        if not self._follow(plan.trajectory[-1].joint_trajectory)[0]:
+-                            raise RuntimeError("接触释放后的撤退段执行失败")
+-                        outcome.update(
+-                            ok=True, stage="SUCCESS",
+-                            message="接触式放置完成（下探触底后张爪释放并撤退）",
+-                        )
+-                        self.get_logger().info("EXECUTION SUCCESS: " + str(outcome["message"]))
+-                        return
+                     raise RuntimeError(f"{stage} 段轨迹执行失败 (错误码 {code})")
+                 if stage == "GRASP":
++                    self._verify_grasp_pose()
+                     if not self._gripper(self.close_width, 3.0):
+                         raise RuntimeError("闭合夹爪失败")
+-                    self.holding = True
+-                    self.get_logger().info("gripper closed on target (堵转夹持)")
++                    self.holding_state = self._holding_observation()
++                    self.holding = self.holding_state != 'empty'
++                    if self.holding_state != 'held':
++                        raise RuntimeError('夹爪闭合后未确认持物: '+self.holding_state)
++                    self.get_logger().info('gripper contact confirmed by fresh finger gap')
++                if stage == 'LIFT' and grasp_stages:
++                    self.holding_state = self._holding_observation()
++                    self.holding = self.holding_state != 'empty'
++                    if self.holding_state != 'held':
++                        raise RuntimeError('提起后未确认持物，可能滑落: '+self.holding_state)
+                 if stage == "PLACE":
+                     if not self._gripper(self.open_width, 3.0):
+                         raise RuntimeError("放置后张开夹爪失败")
+                     self.holding = False
++                    self.holding_state = 'empty'
+                     self.get_logger().info("gripper opened, object placed")
+             placed = "PLACE" in stages
+             message = "抓放序列执行完成" if placed else "抓取完成，物体保持夹持"
+@@ -464,6 +517,7 @@
+
+             self.get_logger().error(f"EXECUTION FAILED: {exc}")
+         finally:
+             outcome["holding"] = self.holding
++            outcome['holding_state'] = self.holding_state
+             self._outcome = outcome
+             self.running = False
+             self._done.set()

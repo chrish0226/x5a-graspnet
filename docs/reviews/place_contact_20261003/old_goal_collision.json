@@ -1,0 +1,25 @@
+{
+  "valid": false,
+  "contacts": [
+    {
+      "body1": "remote_grasp_place_support",
+      "body2": "link7",
+      "depth_m": 0.001403261825944982,
+      "position": [
+        0.2113499061166702,
+        0.3139541698856028,
+        0.0329737828901268
+      ]
+    },
+    {
+      "body1": "remote_grasp_place_support",
+      "body2": "link8",
+      "depth_m": 2.121146183332867e-05,
+      "position": [
+        0.23690231299679215,
+        0.29743703622478873,
+        0.00899731565097861
+      ]
+    }
+  ]
+}

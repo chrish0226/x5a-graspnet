@@ -1,0 +1,105 @@
+[
+  {
+    "capture": "20261003_124328_379018",
+    "original_target_points": 1921,
+    "context_inference_points": 2225,
+    "native_candidates": 0,
+    "deterministic_replay": true,
+    "height_base_m": [
+      0.008415275880455153,
+      0.03527629561009815
+    ],
+    "selected": true,
+    "elapsed_s": 0.443,
+    "planning_requested": false,
+    "failures": [],
+    "kind": "geometric",
+    "index": 4294967295,
+    "required_opening_m": 0.03006994773991155,
+    "tool0": [
+      [
+        -0.38109757253905174,
+        -0.3600109515309216,
+        -0.8515613630165724,
+        0.15692040372721974
+      ],
+      [
+        0.14705995228113658,
+        -0.9329480772142683,
+        0.32860501465630343,
+        0.24549804744660234
+      ],
+      [
+        -0.912763940260521,
+        0.0,
+        0.4084874408841574,
+        0.031508091889738014
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "stages": []
+  },
+  {
+    "capture": "20261003_130521_424692",
+    "original_target_points": 2022,
+    "context_inference_points": 2307,
+    "native_candidates": 6,
+    "deterministic_replay": true,
+    "height_base_m": [
+      0.01044422514973111,
+      0.03653093001026882
+    ],
+    "selected": true,
+    "elapsed_s": 0.48,
+    "planning_requested": false,
+    "failures": [
+      {
+        "index": 4,
+        "score": 0.1429,
+        "reason": "score_or_approach",
+        "detail": "native candidate rejected"
+      },
+      {
+        "index": 5,
+        "score": 0.1347,
+        "reason": "score_or_approach",
+        "detail": "native candidate rejected"
+      }
+    ],
+    "kind": "geometric",
+    "index": 0,
+    "required_opening_m": 0.03203616580345989,
+    "tool0": [
+      [
+        -0.30205052229329765,
+        -0.6732263119716319,
+        -0.6749309704343259,
+        0.12253565362544738
+      ],
+      [
+        0.2750044933131713,
+        -0.7394364968468049,
+        0.6144967012022854,
+        0.29036131725344216
+      ],
+      [
+        -0.912763940260521,
+        0.0,
+        0.4084874408841574,
+        0.03326603095482712
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "stages": []
+  }
+]

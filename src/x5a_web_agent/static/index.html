@@ -24,6 +24,10 @@
       </div>
       <p id="stageText" class="stage">空闲，等待指令</p>
       <p id="stageCode" class="mono">IDLE</p>
+      <div class="row">
+        <span class="label">手上</span>
+        <span id="holdingBadge" class="pill">空手</span>
+      </div>
       <p id="resultText" class="result"></p>
     </section>
 
@@ -60,6 +64,11 @@
         <button type="button" data-color="red" class="swatch red">红色</button>
         <button type="button" data-color="white" class="swatch white">白色</button>
         <button type="button" data-color="orange" class="swatch orange">橙色</button>
+      </div>
+      <div class="colors">
+        <button type="button" data-command="放下" class="swatch">放下</button>
+        <button type="button" data-command="归位" class="swatch">归位</button>
+        <button type="button" data-command="就位" class="swatch">就位</button>
       </div>
       <button id="stopBtn" type="button" class="stop">停止当前任务</button>
       <p class="fineprint">停止按钮只取消任务层，不会代替机械臂底层急停。</p>

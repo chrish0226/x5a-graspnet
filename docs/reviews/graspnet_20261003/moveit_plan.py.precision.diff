@@ -1,0 +1,301 @@
+--- /tmp/x5a_grasp_precision_before_20261003/src/x5a_remote_grasp/x5a_remote_grasp/moveit_plan.py
+
++++ src/x5a_remote_grasp/x5a_remote_grasp/moveit_plan.py
+
+@@ -7,6 +7,7 @@
+
+ 
+ import copy
+ import time
++import numpy as np
+ from dataclasses import dataclass
+ from typing import List, Optional, Sequence, Tuple
+ 
+@@ -28,6 +29,7 @@
+
+     ApplyPlanningScene,
+     GetCartesianPath,
+     GetPositionIK,
++    GetPositionFK,
+     GetStateValidity,
+ )
+ from rclpy.action import ActionClient
+@@ -75,6 +77,7 @@
+
+         jump_threshold: float = 0.0,
+     ) -> None:
+         self.node = node
++        self.deadline = None
+         self.last_solution_seed: Optional[List[float]] = None
+         self.group_name = group_name
+         self.tcp_frame = tcp_frame
+@@ -104,6 +107,15 @@
+
+         self.cartesian_client = node.create_client(
+             GetCartesianPath, cartesian_service, callback_group=callback_group
+         )
++        self.fk_client = node.create_client(GetPositionFK, '/compute_fk', callback_group=callback_group)
++
++    def _timeout(self, requested):
++        if self.deadline is None:
++            return requested
++        return max(0.0, min(requested, self.deadline-time.monotonic()))
++
++    def _wait(self, future, timeout):
++        return self.wait_future(future, self._timeout(timeout))
+ 
+     @staticmethod
+     def wait_future(future, timeout: float) -> bool:
+@@ -115,6 +127,8 @@
+
+         return future.done()
+ 
+     def ready(self, timeout: float = 2.0) -> Tuple[bool, str]:
++        if not self.fk_client.wait_for_service(timeout_sec=timeout):
++            return False, "MoveIt /compute_fk is unavailable"
+         if not self.ik_client.wait_for_service(timeout_sec=timeout):
+             return False, "MoveIt /compute_ik is unavailable"
+         if not self.validity_client.wait_for_service(timeout_sec=timeout):
+@@ -162,6 +176,8 @@
+
+         last_reason = "collision-aware IK failed"
+         seen = set()
+         for attempt in attempts:
++            if self._timeout(1.0) <= 0:
++                return None, 'planning budget exhausted during IK'
+             key = (
+                 "current"
+                 if attempt is None
+@@ -184,7 +200,7 @@
+
+         request.ik_request.ik_link_name = self.tcp_frame
+         request.ik_request.pose_stamped = pose
+         request.ik_request.avoid_collisions = True
+-        seconds = max(0.01, self.ik_timeout)
++        seconds = max(0.01, self._timeout(self.ik_timeout))
+         request.ik_request.timeout.sec = int(seconds)
+         request.ik_request.timeout.nanosec = int((seconds - int(seconds)) * 1.0e9)
+         if seed is None:
+@@ -192,7 +208,7 @@
+
+         else:
+             request.ik_request.robot_state = copy.deepcopy(seed)
+         future = self.ik_client.call_async(request)
+-        if not self.wait_future(future, self.ik_timeout + 1.0):
++        if not self._wait(future, self.ik_timeout + 1.0):
+             return None, "collision-aware IK timed out"
+         response = future.result()
+         if response is None:
+@@ -209,7 +225,7 @@
+
+         request.robot_state = state
+         request.group_name = self.group_name
+         future = self.validity_client.call_async(request)
+-        if not self.wait_future(future, 2.0):
++        if not self._wait(future, 2.0):
+             return False, "state validity check timed out"
+         response = future.result()
+         if response is None:
+@@ -226,6 +242,8 @@
+
+     ) -> Tuple[bool, str]:
+         seed = None
+         for stage, pose in poses:
++            if self._timeout(1.0) <= 0:
++                return None, 'planning budget exhausted'
+             seed, reason = self.collision_aware_ik(
+                 pose,
+                 seed,
+@@ -263,6 +281,8 @@
+
+         trajectories: List[RobotTrajectory] = []
+         stages: List[str] = []
+         for stage, pose in poses:
++            if self._timeout(1.0) <= 0:
++                return None, f'{stage}: planning budget exhausted'
+             velocity, acceleration = self.STAGE_SCALING.get(
+                 stage.upper(), (self.velocity_scaling, self.acceleration_scaling)
+             )
+@@ -275,6 +295,9 @@
+
+             )
+             if trajectory is None or used_start is None:
+                 return None, f"{stage}: {reason}"
++            verified, reason = self.verify_endpoint(trajectory, used_start, pose)
++            if not verified:
++                return None, f'{stage}: {reason}'
+             if not trajectory.joint_trajectory.points:
+                 return None, f"{stage}: MoveIt returned an empty trajectory"
+             if trajectory_start is None:
+@@ -282,6 +305,7 @@
+
+             trajectories.append(trajectory)
+             stages.append(stage)
+             start_state = self.end_state(used_start, trajectory)
++            self.last_solution_seed = self._arm_joints(start_state)
+         assert trajectory_start is not None
+         return SequencePlan(stages, trajectories, trajectory_start), ""
+ 
+@@ -301,8 +325,9 @@
+
+             if trajectory is not None:
+                 return trajectory, start_state, ""
+             self.node.get_logger().warn(
+-                f"{stage} cartesian failed ({reason}); falling back to IK/joint planning"
+-            )
++                f"{stage} cartesian failed ({reason}); rejecting incomplete approach"
++            )
++            return None, None, f'{stage}: complete straight approach required: {reason}'
+         extra = None if start_state is not None else getattr(
+             self, "default_joint_seeds", None
+         )
+@@ -319,6 +344,7 @@
+
+             )
+         elif ik_reason:
+             self.node.get_logger().warn(f"{stage} IK failed ({ik_reason})")
++            return None, None, ik_reason
+         result, reason = self.plan_pose(pose, start_state, velocity, acceleration)
+         if result is None:
+             return None, None, reason
+@@ -355,13 +381,15 @@
+
+         waypoint.orientation = pose.pose.orientation
+         request.waypoints = [waypoint]
+         future = self.cartesian_client.call_async(request)
+-        if not self.wait_future(future, 30.0):
++        if not self._wait(future, 30.0):
+             return None, "cartesian path timed out"
+         response = future.result()
+         if response is None:
+             return None, "cartesian path returned no response"
+         fraction = float(response.fraction)
+-        if fraction < self.min_cartesian_fraction:
++        if response.error_code.val != MOVEIT_SUCCESS:
++            return None, f'cartesian path failed ({response.error_code.val})'
++        if fraction < max(0.9999, self.min_cartesian_fraction):
+             return None, f"cartesian fraction {fraction:.2f} below {self.min_cartesian_fraction:.2f}"
+         if not response.solution.joint_trajectory.points:
+             return None, "cartesian path returned an empty trajectory"
+@@ -378,14 +406,15 @@
+
+         points = trajectory.joint_trajectory.points
+         if len(points) < 2:
+             return
+-        factor = 1.0 / min(1.0, max(0.001, velocity))
++        factor = max(1.0 / min(1.0, max(0.001, velocity)),
++                     1.0 / np.sqrt(min(1.0, max(0.001, acceleration))))
+         accel_factor = factor * factor
+         for point in points:
+             stamp = point.time_from_start
+             total = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+             total *= factor
+-            stamp.sec = int(total)
+-            stamp.nanosec = int(round((total - int(total)) * 1e9))
++            nanos = int(round(total*1e9))
++            stamp.sec, stamp.nanosec = divmod(nanos, 1000000000)
+             if len(point.velocities) == len(point.positions):
+                 point.velocities = [float(v) / factor for v in point.velocities]
+             if len(point.accelerations) == len(point.positions):
+@@ -426,7 +455,7 @@
+
+         request = MotionPlanRequest()
+         request.group_name = self.group_name
+         request.num_planning_attempts = max(1, self.attempts)
+-        request.allowed_planning_time = max(0.1, self.allowed_time)
++        request.allowed_planning_time = max(0.01, self._timeout(self.allowed_time))
+         request.max_velocity_scaling_factor = min(1.0, max(0.001, velocity_scaling))
+         request.max_acceleration_scaling_factor = min(
+             1.0, max(0.001, acceleration_scaling)
+@@ -440,8 +469,8 @@
+
+             joint = JointConstraint()
+             joint.joint_name = name
+             joint.position = float(value)
+-            joint.tolerance_above = 0.05
+-            joint.tolerance_below = 0.05
++            joint.tolerance_above = 0.003
++            joint.tolerance_below = 0.003
+             joint.weight = 1.0
+             constraint.joint_constraints.append(joint)
+         request.goal_constraints = [constraint]
+@@ -449,13 +478,13 @@
+
+         goal.planning_options = PlanningOptions()
+         goal.planning_options.plan_only = True
+         send_future = self.move_client.send_goal_async(goal)
+-        if not self.wait_future(send_future, 5.0):
++        if not self._wait(send_future, 5.0):
+             return None, "MoveGroup joint goal timed out"
+         handle = send_future.result()
+         if handle is None or not handle.accepted:
+             return None, "MoveGroup rejected joint-space goal"
+         result_future = handle.get_result_async()
+-        if not self.wait_future(result_future, self.result_timeout):
++        if not self._wait(result_future, self.result_timeout):
+             handle.cancel_goal_async()
+             return None, "MoveGroup joint planning timed out"
+         wrapped = result_future.result()
+@@ -482,7 +511,7 @@
+
+         request = MotionPlanRequest()
+         request.group_name = self.group_name
+         request.num_planning_attempts = max(1, self.attempts)
+-        request.allowed_planning_time = max(0.1, self.allowed_time)
++        request.allowed_planning_time = max(0.01, self._timeout(self.allowed_time))
+         velocity = self.velocity_scaling if velocity_scaling is None else velocity_scaling
+         acceleration = (
+             self.acceleration_scaling if acceleration_scaling is None else acceleration_scaling
+@@ -518,13 +547,13 @@
+
+         goal.planning_options = PlanningOptions()
+         goal.planning_options.plan_only = True
+         send_future = self.move_client.send_goal_async(goal)
+-        if not self.wait_future(send_future, 5.0):
++        if not self._wait(send_future, 5.0):
+             return None, "MoveGroup goal timed out"
+         handle = send_future.result()
+         if handle is None or not handle.accepted:
+             return None, "MoveGroup rejected planning-only goal"
+         result_future = handle.get_result_async()
+-        if not self.wait_future(result_future, self.result_timeout):
++        if not self._wait(result_future, self.result_timeout):
+             handle.cancel_goal_async()
+             return None, "MoveGroup planning timed out"
+         wrapped = result_future.result()
+@@ -532,6 +561,34 @@
+
+             code = 0 if wrapped is None else wrapped.result.error_code.val
+             return None, f"MoveGroup planning failed ({code})"
+         return wrapped.result, ""
++
++    def verify_endpoint(self, trajectory, start, pose):
++        """Reject trajectories that terminate short of the requested TCP pose."""
++        if not trajectory.joint_trajectory.points:
++            return False, 'empty endpoint trajectory'
++        if not self.fk_client.wait_for_service(timeout_sec=self._timeout(0.5)):
++            return False, 'endpoint FK service unavailable'
++        request = GetPositionFK.Request()
++        request.header = pose.header
++        request.fk_link_names = [self.tcp_frame]
++        request.robot_state = self.end_state(start, trajectory)
++        future = self.fk_client.call_async(request)
++        if not self._wait(future, 2.0):
++            return False, 'endpoint FK timed out'
++        result = future.result()
++        if result is None or result.error_code.val != MOVEIT_SUCCESS or not result.pose_stamped:
++            return False, 'endpoint FK failed'
++        actual = result.pose_stamped[0].pose
++        target = pose.pose
++        error = np.linalg.norm([actual.position.x-target.position.x,
++                               actual.position.y-target.position.y,
++                               actual.position.z-target.position.z])
++        a = np.array([actual.orientation.x, actual.orientation.y, actual.orientation.z, actual.orientation.w])
++        b = np.array([target.orientation.x, target.orientation.y, target.orientation.z, target.orientation.w])
++        angle = 2*np.arccos(np.clip(abs(np.dot(a, b))/(np.linalg.norm(a)*np.linalg.norm(b)), 0, 1))
++        if not np.isfinite(error+angle) or error > self.position_tolerance or angle > self.orientation_tolerance:
++            return False, f'TCP endpoint error {error*1000:.1f}mm/{np.degrees(angle):.1f}deg'
++        return True, ''
+ 
+     @staticmethod
+     def end_state(start: RobotState, trajectory: RobotTrajectory) -> RobotState:

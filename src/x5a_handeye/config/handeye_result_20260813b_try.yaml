@@ -1,0 +1,133 @@
+calibration_type: eye_to_hand
+method_convention: opencv_calibrateHandEye_eye_to_hand
+parent_frame: base_link
+camera_frame: camera_color_optical_frame
+camera_root_frame: camera_link
+tool_frame: tool0
+board_frame: calibration_board
+translation:
+  x: 0.3216390276198208
+  y: 0.28157867959760463
+  z: 0.47702058599486097
+rotation:
+  x: -0.6745242800822113
+  y: -0.7170579466408727
+  z: 0.13013023450680203
+  w: 0.11794498211435173
+T_base_camera:
+- - -0.06221195354723926
+  - 0.9366495741074445
+  - -0.3446987788782826
+  - 0.3216390276198208
+- - 0.9980424068332091
+  - 0.056166235293559214
+  - -0.02750832920270067
+  - 0.28157867959760463
+- - -0.006405232112236546
+  - -0.3457353458026701
+  - -0.9383102065225003
+  - 0.47702058599486097
+- - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+T_tool_board:
+- - 0.0337468547916866
+  - -0.9994303489131721
+  - -0.0003570195571335807
+  - 0.04745335329999176
+- - 0.9991303667597803
+  - 0.03374547390962057
+  - -0.024489859311193185
+  - -0.06539795852772307
+- - 0.024487956430370772
+  - 0.00046974664498438193
+  - 0.9997000146683773
+  - 0.035188575814191915
+- - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+tool_board_translation:
+  x: 0.04745335329999176
+  y: -0.06539795852772307
+  z: 0.035188575814191915
+tool_board_rotation:
+  x: 0.008679951233859697
+  y: -0.008640087522077977
+  z: 0.6950193677098269
+  w: 0.7188866988910152
+solver: PARK
+samples:
+  total: 28
+  train: 23
+  used: 22
+  holdout: 5
+  source: /home/quella/arx/arm/src/x5a_handeye/data/manual_samples_recalib_20260813b.json
+  collection: manual_gravity_readonly_urdf_fk
+  used_indices:
+  - 0
+  - 1
+  - 2
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 14
+  - 15
+  - 16
+  - 18
+  - 19
+  - 20
+  - 22
+  - 23
+  - 24
+  - 25
+  - 27
+motion_diversity:
+  ok: true
+  n_motions: 27
+  angles_deg_mean: 51.54885393625897
+  angles_deg_max: 106.69514200897238
+  max_abs_axis_dot: 0.9968333671728846
+  parallel_warning: true
+error:
+  translation_mean_m: 0.005122017049161382
+  translation_median_m: 0.004518961840111434
+  translation_max_m: 0.011221257633115003
+  rotation_mean_deg: 1.6200328586002721
+  rotation_max_deg: 3.200405422301107
+holdout_error:
+  translation_mean_m: 0.004179363479967521
+  translation_median_m: 0.004504218402002695
+  translation_max_m: 0.00547249106968013
+  rotation_mean_deg: 1.5505358825693452
+  rotation_max_deg: 2.254165348726758
+all_samples_error:
+  translation_mean_m: 0.005279988256628405
+  translation_median_m: 0.004528320478430954
+  translation_max_m: 0.014258478704207338
+  rotation_mean_deg: 1.780458253774432
+  n_under_15mm: 28
+solver_comparison:
+- solver: PARK
+  translation_mean_m: 0.005122017049161382
+  rotation_mean_deg: 1.6200328586002721
+- solver: HORAUD
+  translation_mean_m: 0.0051889055925271
+  rotation_mean_deg: 1.6150648644567662
+- solver: ANDREFF
+  translation_mean_m: 0.02397768404863314
+  rotation_mean_deg: 1.625321899635194
+- solver: DANIILIDIS
+  translation_mean_m: 0.024877667730198116
+  rotation_mean_deg: 2.0980330361625668
+- solver: TSAI
+  translation_mean_m: 0.1693138850045616
+  rotation_mean_deg: 40.130700821663666
+verdict: PASS
+pass_criteria_mm: 10.0

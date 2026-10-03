@@ -121,6 +121,7 @@ class OfficialTrajectoryAdapter(Node):
         self.declare_parameter("status_timeout", 0.25)
         self.declare_parameter("state_settle_sec", 2.0)
         self.declare_parameter("max_status_jump_rad", 0.08)
+        self.declare_parameter("max_status_speed_rad_s", 1.5)
         self.declare_parameter("start_tolerance_rad", 0.15)
         self.declare_parameter("goal_tolerance_rad", 0.01)
         self.declare_parameter("goal_time_tolerance_sec", 2.0)
@@ -151,6 +152,7 @@ class OfficialTrajectoryAdapter(Node):
         self.status_timeout = float(g("status_timeout"))
         self.state_settle = float(g("state_settle_sec"))
         self.max_status_jump = float(g("max_status_jump_rad"))
+        self.max_status_speed = float(g("max_status_speed_rad_s"))
         self.start_tolerance = float(g("start_tolerance_rad"))
         self.goal_tolerance = float(g("goal_tolerance_rad"))
         self.goal_time_tolerance = float(g("goal_time_tolerance_sec"))
@@ -238,10 +240,30 @@ class OfficialTrajectoryAdapter(Node):
                 self.state_started_time = received_at
                 self.last_state_jump_time = received_at
             else:
+                status_gap = received_at - self.last_status_time
                 jump = max(abs(a - b) for a, b in zip(new_q, self.q))
-                if jump > self.max_status_jump:
+                # A fixed per-message jump threshold falsely reports a state
+                # fault after a short scheduler/CAN gap.  Scale the allowed
+                # delta by elapsed time while retaining the original 0.08 rad
+                # noise floor at the normal 30 Hz publication rate.
+                allowed_jump = max(
+                    self.max_status_jump,
+                    self.max_status_speed * max(0.0, status_gap),
+                )
+                if status_gap > self.status_timeout:
+                    # A real feedback outage is allowed to recover, but the
+                    # arm must publish stable state for state_settle seconds
+                    # before another command is accepted.
                     self.last_state_jump_time = received_at
-                    self.state_fault = f"official state jumped by {jump:.3f} rad"
+                    self.state_fault = (
+                        f"official state recovering after {status_gap:.3f}s gap"
+                    )
+                elif jump > allowed_jump:
+                    self.last_state_jump_time = received_at
+                    self.state_fault = (
+                        f"official state jumped by {jump:.3f} rad "
+                        f"(allowed {allowed_jump:.3f})"
+                    )
                 elif (
                     self.state_fault
                     and received_at - self.last_state_jump_time >= self.state_settle
@@ -430,7 +452,8 @@ class OfficialTrajectoryAdapter(Node):
                 result.reached_goal = False
                 goal_handle.abort()
                 return result
-            result.reached_goal = True
+            result.reached_goal = abs(actual_m-target_m) <= self.gripper_tolerance
+            result.stalled = not result.reached_goal and target_m <= self.gripper_open_threshold
             goal_handle.succeed()
             self.get_logger().info(
                 f"[GRIPPER] GRIPPER_SUCCESS t_ns={now_ns()} "

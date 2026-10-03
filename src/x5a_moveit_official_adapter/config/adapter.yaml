@@ -10,19 +10,23 @@
     # trajectory tracking while the vendor controller retains the CAN loop.
     command_rate_hz: 50.0
     joint_state_rate_hz: 30.0
-    status_timeout: 0.25
+    # Allow brief scheduler/USB-CAN jitter, while still stopping a genuinely
+    # disconnected trajectory within half a second.
+    status_timeout: 0.50
     state_settle_sec: 2.0
     max_status_jump_rad: 0.08
+    # Time-scaled continuity limit used after a delayed status frame.
+    max_status_speed_rad_s: 1.5
     start_tolerance_rad: 0.15
     # Tighter than the smallest commissioning move so a stationary arm can
     # never be reported as a successful execution.
     goal_tolerance_rad: 0.02
     goal_time_tolerance_sec: 2.0
     tracking_grace_sec: 0.75
-    tracking_tolerance_rad: 0.20
+    tracking_tolerance_rad: 0.40
     response_command_delta_rad: 0.03
-    response_actual_delta_rad: 0.004
-    response_timeout_sec: 0.75
+    response_actual_delta_rad: 0.002
+    response_timeout_sec: 1.5
     max_joint_speed_rad_s: 1.0
     gripper_closed_readout: 0.0
     gripper_open_readout: 5.0

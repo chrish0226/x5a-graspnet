@@ -1,0 +1,28 @@
+# Select and optionally plan a remote SAM + GraspNet grasp.
+# This interface deliberately contains no execute flag. The server is
+# perception/visualization/plan-only and never sends a controller goal.
+string prompt
+float32 min_depth
+float32 max_depth
+uint16 top_k
+bool plan_motion
+---
+bool success
+string error_message
+geometry_msgs/PoseStamped selected_pose
+geometry_msgs/PoseStamped pregrasp_pose
+geometry_msgs/PoseStamped lift_pose
+geometry_msgs/PoseStamped retreat_pose
+float32 gripper_width_m
+float32 score
+uint32 selected_index
+uint32 candidate_count
+bool ik_valid
+bool collision_free
+bool plan_valid
+string source_frame
+string[] planned_stages
+---
+string stage
+uint32 candidate_index
+string detail

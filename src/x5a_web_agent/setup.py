@@ -22,6 +22,7 @@ setup(
     entry_points={
         "console_scripts": [
             "web_agent = x5a_web_agent.app:main",
+            "text_cli = x5a_web_agent.text_cli:main",
         ]
     },
 )

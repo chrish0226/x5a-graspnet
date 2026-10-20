@@ -82,3 +82,61 @@ def test_queries_are_read_only_while_busy(monkeypatch, query, part):
     monkeypatch.setattr(web,'_job',marker)
     reply=asyncio.run(web.dispatch({'action':'status','query':query}))
     assert reply['ok'] and part in reply['message'] and web._job is marker
+
+
+@pytest.mark.parametrize('pronoun', ['它', '他', '她'])
+def test_asr_pronouns_and_omitted_on(pronoun):
+    assert parse_wrist_command(f'把{pronoun}放到橙色方块') == {'action':'place','destination_color':'orange'}
+
+
+def test_named_held_cube_is_placement_with_expected_source():
+    text = '把白色方块放到橙色方块上'
+    assert parse_wrist_command(text)['action'] == 'pick_place'
+    assert parse_wrist_command(text, {'holding':True,'holding_color':'white'}) == {
+        'action':'place','source_color':'white','destination_color':'orange'}
+    assert parse_wrist_command(text, {'holding':True,'holding_color':'red'})['action'] == 'unknown'
+
+
+@pytest.mark.parametrize('tail', ['然后再拿起来放到红色方块上', '然后把它拿起来放到红块上',
+                                  '再拿起来放红块上', '接着拿起来再放到红色上'])
+def test_repick_refers_to_last_manipulated_cube(tail):
+    assert parse_wrist_command('把白色方块放到橙色方块上，'+tail) == {
+        'action':'task_sequence','tasks':[
+            {'action':'pick_place','target_color':'white','destination_color':'orange'},
+            {'action':'pick_place','target_color':'white','destination_color':'red'}]}
+
+
+def test_repick_across_utterances_uses_confirmed_robot_context():
+    context = {'holding':False,'last_moved_color':'white','last_support_color':'orange'}
+    assert parse_wrist_command('再拿起来放红块上', context) == {
+        'action':'pick_place','target_color':'white','destination_color':'red'}
+    assert parse_wrist_command('再拿起来放红块上')['action'] == 'unknown'
+    result = parse_wrist_command('再拿起来放白块上', context)
+    assert result['action'] == 'unknown' and '拿橙块' in result['message']
+
+
+def test_literal_self_reference_requests_clarification_before_first_step():
+    task = parse_wrist_command('把白色方块放到橙色方块上，然后再拿起来放到白色方块上')
+    assert task['action'] == 'unknown' and '不能放到自身' in task['message']
+    assert '拿橙块' in task['message']
+
+
+def test_explicit_swap_uses_existing_clearing_instead_of_rejecting_repeat_colors():
+    task = parse_wrist_command('把白块放到橙块上，然后把橙块放到白块上')
+    assert task['action'] == 'task_sequence'
+    assert [(t['target_color'],t['destination_color']) for t in task['tasks']] == [
+        ('white','orange'),('orange','white')]
+
+
+@pytest.mark.parametrize('text', ['把白块放到橙块上，然后把它拿起来放到蓝块上',
+    '把白块放到橙块上，然后转一下', '把白块放到橙块上，然后再拿起来放到白块上',
+    '把白块放到橙块上，然后把红块放到白块上'])
+def test_invalid_later_step_rejects_entire_program(text):
+    assert parse_wrist_command(text)['action'] == 'unknown'
+
+
+
+def test_terminal_describes_every_resolved_color_step():
+    from x5a_web_agent.task_sequence import describe_task
+    task=parse_wrist_command('把白块放橙块上，然后再拿起来放红块上')
+    assert describe_task(task) == '白块 → 橙块；然后 白块 → 红块'

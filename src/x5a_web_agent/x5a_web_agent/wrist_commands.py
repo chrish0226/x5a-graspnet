@@ -2,6 +2,7 @@
 import re
 from x5a_web_agent.command_parser import COLOR_ALIASES
 from x5a_web_agent.task_sequence import split_sequence
+from x5a_pick_place.color_sequence import color_step_pairs
 
 COLORS = ('red', 'white', 'orange')
 _ALIASES = {alias: color for color in COLORS for alias in COLOR_ALIASES[color]}
@@ -11,10 +12,10 @@ _OBJECT = r'(?:的)?(?:那个|这个)?(?:小)?(?:方块|积木|正方体|立方�
 _PREFIX = r'(?:请帮我|请|帮我|麻烦|帮忙)?(?:把|将|抓起|拿起|抓取|抓|拿|取|夹|pick|grab)?(?:一下)?(?:一个|一块|个)?(?:那个|这个)?'
 _SUFFIX = r'(?:一下|吧|好吗|好么)?'
 _PLACE = r'(?:放到|放在|摆到|摆在|放置到|叠到|叠在|放上|堆到)'
-_STACK = re.compile(rf'{_PREFIX}(?P<source>{_COLOR}){_OBJECT}{_PLACE}(?P<destination>{_COLOR}){_OBJECT}(?:的)?(?:上面|上边|顶部|顶上|上){_SUFFIX}')
+_STACK = re.compile(rf'{_PREFIX}(?P<source>{_COLOR}){_OBJECT}{_PLACE}(?P<destination>{_COLOR}){_OBJECT}(?:的)?(?:上面|上边|顶部|顶上|上)?{_SUFFIX}')
 _BOX = re.compile(rf'{_PREFIX}(?P<source>{_COLOR}){_OBJECT}(?:放到|放进|放入|放在|扔进|放置到)(?:那个|这个)?(?:黑色|黑)?(?:盒子|盒|箱子)(?:里面|里|内|中)?{_SUFFIX}')
 _PICK = re.compile(rf'{_PREFIX}(?P<source>{_COLOR}){_OBJECT}{_SUFFIX}')
-_HELD_PREFIX = r'(?:请帮我|请|帮我|麻烦|帮忙)?(?:把|将)?(?:它|这个方块|这个|手里的方块|夹着的方块)?'
+_HELD_PREFIX = r'(?:请帮我|请|帮我|麻烦|帮忙)?(?:把|将)?(?:它|他|她|这个方块|这个|手里的方块|夹着的方块)?'
 _HELD_STACK = re.compile(rf'{_HELD_PREFIX}{_PLACE}(?P<destination>{_COLOR}){_OBJECT}(?:的)?(?:上面|上边|顶部|顶上|上)?{_SUFFIX}')
 _HELD_BOX = re.compile(rf'{_HELD_PREFIX}(?:放到|放进|放入|放在|放置到)(?:那个|这个)?(?:黑色|黑)?(?:盒子|盒|箱子)(?:里面|里|内|中)?{_SUFFIX}')
 _BATCH_BOX = re.compile(
@@ -95,7 +96,7 @@ def _unknown(message):
     return {'action': 'unknown', 'message': message}
 
 
-def parse_wrist_command(text):
+def parse_wrist_command(text, context=None):
     raw = str(text or '').strip()
     # Cancellation wins over every other verb and every clause.
     if re.search(r'取消|停止|停下|(?:不要|别|先别|不许)(?:再)?(?:抓|拿|夹|放|动|执行)|急停|\bstop\b|\bcancel\b', raw, re.I):
@@ -111,19 +112,74 @@ def parse_wrist_command(text):
         return {'action': 'status', 'query': 'all'}
     try:
         clauses = split_sequence(raw)
+        if clauses:
+            return _parse_program(clauses, context or {})
     except ValueError as exc:
         return _unknown(str(exc))
-    if clauses:
-        tasks = [_parse_single(_normalize_spoken(re.sub(r'^先', '', clause))) for clause in clauses]
-        if (len(tasks) == 2 and tasks[0]['action'] == 'pick' and tasks[1]['action'] == 'place'
-                and tasks[0]['target_color'] != tasks[1]['destination_color']):
-            return {'action': 'pick_place', 'target_color': tasks[0]['target_color'],
-                    'destination_color': tasks[1]['destination_color']}
-        colors = [task.get('target_color') for task in tasks]
-        if (2 <= len(tasks) <= 3 and len(set(colors)) == len(colors)
-                and all(task['action'] == 'pick_place' and task.get('destination_color', 'box') == 'box' for task in tasks)):
-            return {'action': 'sequence', 'tasks': tasks}
-        return _unknown('这组顺序指令暂不支持；可说“先抓红块，然后放到白块上”，或依次把不同颜色放进盒子')
     if re.fullmatch(r'(?:把|将)?(?:这|那)?(?:三个|三块|所有|全部)(?:的)?(?:小)?(?:方块|积木|块)?(?:都|全部|一起|依次|按顺序)?放进(?:黑色|黑)?盒子(?:里面|里|内|中)?', normalized):
         return {'action': 'sequence', 'tasks': [{'action': 'pick_place', 'target_color': color} for color in COLORS]}
-    return _parse_single(normalized)
+    task = _parse_single(normalized)
+    if task['action'] == 'unknown':
+        try:
+            return _parse_program([raw], context or {})
+        except ValueError as exc:
+            return _unknown(str(exc))
+    return _held_context(task, context or {})
+
+
+def _held_context(task, context):
+    if task.get('action') == 'pick_place' and context.get('holding'):
+        source = context.get('holding_color')
+        if source in COLORS and source == task['target_color']:
+            return {'action': 'place', 'source_color': source,
+                    'destination_color': task.get('destination_color', 'box')}
+        if source in COLORS:
+            return _unknown('当前夹着另一颜色，请先放置当前方块')
+    return task
+
+
+def _parse_program(clauses, context):
+    held = context.get('holding_color') if context.get('holding') else None
+    subject = held or context.get('last_moved_color')
+    support = context.get('last_support_color')
+    tasks = []
+    for index, clause in enumerate(clauses, 1):
+        text = _normalize_spoken(clause)
+        text = re.sub(r'^(?:先|再)(?=把|将|抓|拿|夹|放)', '', text)
+        task = _parse_single(text)
+        if task['action'] == 'unknown':
+            # Explicit re-pick with an omitted object, e.g. 再拿起来放到红块上.
+            match = re.fullmatch(r'(?:把|将)?(?:它|他|她|这个方块)?(?:抓|拿|夹)(?:起来|起)?(?:它|他|她|这个方块)?(?:再)?(.*)', text)
+            if match:
+                tail = match[1]
+                place = _parse_single(tail) if tail else {'action': 'pick'}
+                if place['action'] in ('place', 'pick'):
+                    if subject not in COLORS:
+                        raise ValueError(f'第 {index} 步“再拿起来”缺少指代，请说出颜色')
+                    destination = place.get('destination_color', 'hold')
+                    if subject == destination:
+                        label = {'red': '红', 'white': '白', 'orange': '橙'}
+                        hint = f'；你是指拿{label[support]}块放到{label[destination]}块上吗？' if support in COLORS and support != destination else ''
+                        raise ValueError(f'第 {index} 步默认指刚操作的{label[subject]}块，不能放到自身上'+hint)
+                    task = {'action': 'pick', 'target_color': subject} if destination == 'hold' else {
+                        'action': 'pick_place', 'target_color': subject, 'destination_color': destination}
+        if task['action'] == 'place' and tasks and tasks[-1]['action'] == 'pick':
+            previous = tasks.pop()
+            task = {'action': 'pick_place', 'target_color': previous['target_color'],
+                    'destination_color': task['destination_color']}
+        if task['action'] == 'place' and not tasks and held in COLORS:
+            task = {'action': 'pick_place', 'target_color': held, 'destination_color': task['destination_color']}
+        if task['action'] not in ('pick_place', 'pick', 'place'):
+            raise ValueError(f'第 {index} 步无法明确解析，整条指令未执行：{clause}')
+        tasks.append(task)
+        if task.get('target_color') in COLORS:
+            subject = task['target_color']
+        if task['action'] == 'pick_place':
+            support = task.get('destination_color')
+    color_step_pairs(tasks, held)
+    if len(tasks) == 1:
+        return _held_context(tasks[0], context)
+    if (len(tasks) <= 3 and len({t.get('target_color') for t in tasks}) == len(tasks)
+            and all(t['action'] == 'pick_place' and t.get('destination_color', 'box') == 'box' for t in tasks)):
+        return {'action': 'sequence', 'tasks': tasks}
+    return {'action': 'task_sequence', 'tasks': tasks}

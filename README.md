@@ -13,7 +13,7 @@
 | 定位 | 云端 SAM 文本分割 + 本地深度 | HSV 红 / 白 / 橙方块及盒沿 |
 | 抓姿 | GraspNet 原生候选 + 经检查的几何备用姿态 | 本地方块策略 |
 | 求解与规划 | TRAC-IK Speed、4 个 IK worker、OMPL RRTConnect | 默认 KDL、MoveIt |
-| 交互 | 分开抓放、整句抓放、多步骤队列 | 颜色抓放、观察侧、自动清障及运行内场景记忆 |
+| 交互 | 分开抓放、整句抓放、多步骤队列 | 持物颜色与代词承接、最多 8 步连续抓放、观察侧、清障及运行内场景记忆 |
 | 启动 | `bash scripts/start_sam.sh` | `bash scripts/start.sh` |
 | 不执行动作的检查 | `bash scripts/start_sam.sh --plan-only`：推理与规划 | `bash scripts/start.sh --dry-run`：仅交互，不规划 |
 | 页面 | HTTP 8000 / HTTPS 8443 | HTTP 8001 / HTTPS 8444，另提供旧端口兼容 |
@@ -199,7 +199,7 @@ X5A_TEST_ROS_DOMAIN_ID=157 /usr/bin/python3 -m pytest -q \
   src/x5a_vision/test src/x5a_handeye/test --disable-warnings
 ```
 
-2026-10-20 颜色优化后的完整回归 **634 项通过**。`conftest.py` 从 `X5A_TEST_ROS_DOMAIN_ID` 设置测试域，仅设置 `ROS_DOMAIN_ID` 会被覆盖。保存场景回放、性能测量及实机验证边界见 [验证记录](docs/VALIDATION.md)。
+2026-10-20 颜色交互与连续抓放修复后的完整回归 **677 项通过**。`conftest.py` 从 `X5A_TEST_ROS_DOMAIN_ID` 设置测试域，仅设置 `ROS_DOMAIN_ID` 会被覆盖。保存场景回放、性能测量及实机验证边界见 [验证记录](docs/VALIDATION.md)。
 
 - 标定留出集最大误差约 4.7 mm，严格 3 mm 验收失败；棱角对齐尚无高精度实机堆叠保证。
 - SAM 持物点云尚未作为完整附着碰撞体覆盖所有运动阶段，其他物体的场景建模也不完整。完整轨迹不代表所有物体与环境接触都已验证。

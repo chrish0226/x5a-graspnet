@@ -37,6 +37,9 @@ ACTION_ZH = {
     "go_home": "归位",
     "go_ready": "就位",
     "sequence": "序列",
+    "task_sequence": "连续抓放",
+    "pick": "抓起",
+    "place": "放置",
     "cancel": "取消",
 }
 
@@ -214,7 +217,7 @@ class TerminalConsole:
     def _print_parsed(self, parsed: Any) -> None:
         if not isinstance(parsed, dict):
             return
-        if parsed.get('action') == 'sequence':
+        if parsed.get('action') in ('sequence', 'task_sequence'):
             tasks = parsed.get('tasks', [])
             self._line('解析', f'连续任务，共 {len(tasks)} 步')
             for index, task in enumerate(tasks, 1):

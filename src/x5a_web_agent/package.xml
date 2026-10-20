@@ -12,6 +12,7 @@
   <depend>std_msgs</depend>
   <depend>action_msgs</depend>
   <depend>x5a_task_interfaces</depend>
+  <depend>x5a_pick_place</depend>
   <exec_depend>python3-paho-mqtt</exec_depend>
   <export>
     <build_type>ament_python</build_type>

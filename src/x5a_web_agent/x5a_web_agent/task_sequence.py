@@ -38,7 +38,7 @@ def describe_task(task):
     if text:
         return text
     action = task.get('action')
-    if action == 'sequence':
+    if action in ('sequence', 'task_sequence'):
         return '；然后 '.join(describe_task(item) for item in task.get('tasks', []))
     if action == 'remote_grasp':
         prompt = str(task.get('prompt') or '')
@@ -50,6 +50,15 @@ def describe_task(task):
         return f'抓取 {grasp}'
     if action == 'remote_place':
         return f'放到 {task.get("prompt", "目标")}' + ('上' if task.get('relation', 'on') == 'on' else '里')
+    labels = {'red': '红块', 'white': '白块', 'orange': '橙块', 'box': '盒子', 'hold': '夹持等待'}
+    source = labels.get(task.get('target_color'), task.get('target_color', '方块'))
+    destination = labels.get(task.get('destination_color', 'box'), '目标')
+    if action == 'pick_place' and task.get('target_color') in labels:
+        return f'{source} → {destination}'
+    if action == 'pick':
+        return f'抓起{source}，夹持等待'
+    if action == 'place':
+        return f'当前持物 → {destination}'
     return {'go_ready': '回到观察位', 'go_home': '回原点', 'release': '原地松开夹爪',
             'pick_place': f'抓放 {task.get("target_color", "")}', 'cancel': '取消'}.get(action, str(action or '未知任务'))
 

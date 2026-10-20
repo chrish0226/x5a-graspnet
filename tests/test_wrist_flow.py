@@ -1343,3 +1343,206 @@ def test_no_valid_stack_orientation_keeps_holding_and_never_releases(robot,monke
     monkeypatch.setattr(robot,'call_gripper',lambda *args:pytest.fail('must not release'))
     assert not robot.execute_place_motion((.30,.30,.081),[[0.,1.1,0.]],(.30,.30,.041))[0]
     assert robot._holding and robot.placement_ready()
+
+
+# Ordered colour programmes share one server owner, including clearing and observations.
+def program_goal(sources=('white','white'), destinations=('orange','red')):
+    from x5a_task_interfaces.action import ColorSequence
+    return ColorSequence.Goal(source_colors=list(sources), destination_colors=list(destinations))
+
+
+def test_named_held_white_never_reenters_detection_or_grasp(robot, monkeypatch):
+    known_held_white(robot)
+    monkeypatch.setattr(robot,'clear_target_if_needed',Mock(side_effect=AssertionError('held cube has no tabletop face')))
+    monkeypatch.setattr(robot,'execute_pick_place',Mock(side_effect=AssertionError('must not regrasp')))
+    place=Mock(return_value=(True,'已放置'))
+    monkeypatch.setattr(robot,'execute_held_placement',place)
+    assert robot.execute_color_step('white','orange')[0]
+    place.assert_called_once_with('orange')
+    place.reset_mock()
+    assert not robot.execute_color_step('red','orange')[0]
+    place.assert_not_called()
+    assert robot._holding
+
+
+def test_unknown_held_geometry_cannot_start_a_new_grasp(robot, monkeypatch):
+    robot._holding=True
+    monkeypatch.setattr(robot,'execute_pick_place',Mock(side_effect=AssertionError('no grasp while holding')))
+    assert not robot.execute_color_step('white','orange')[0]
+    assert robot._holding
+
+
+def test_program_has_one_owner_and_refreshes_between_steps(robot,monkeypatch):
+    robot._prepared=True
+    calls=[]
+    def step(source,destination):
+        assert robot._busy
+        assert robot.goal_callback(goal('red')) == GoalResponse.REJECT
+        assert robot.sequence_goal_callback(program_goal()) == GoalResponse.REJECT
+        calls.append((source,destination))
+        return True,'已放置'
+    monkeypatch.setattr(robot,'execute_color_step',step)
+    observe=Mock(return_value=True)
+    monkeypatch.setattr(robot,'_wait_observation',observe)
+    request=program_goal()
+    assert robot.sequence_goal_callback(request) == GoalResponse.ACCEPT
+    h=handle(request);h.publish_feedback=Mock()
+    result=robot.sequence_execute_callback(h)
+    assert result.success and result.completed_steps == 2
+    assert calls == [('white','orange'),('white','red')]
+    assert [c.kwargs for c in observe.call_args_list] == [{'require_image':True},{'require_image':False}]
+    assert h.publish_feedback.call_count == 2 and not robot._busy
+    assert robot._sequence_total == 0
+    h.succeed.assert_called_once()
+
+
+@pytest.mark.parametrize('stop', ['failure','cancel','exception','observation'])
+def test_program_stops_without_next_step(robot,monkeypatch,stop):
+    robot._prepared=True
+    calls=[]
+    def step(source,destination):
+        calls.append((source,destination))
+        if stop == 'exception': raise RuntimeError('执行失败')
+        if stop == 'cancel': robot.request_cancel()
+        return stop != 'failure','规划失败' if stop == 'failure' else '已放置'
+    monkeypatch.setattr(robot,'execute_color_step',step)
+    monkeypatch.setattr(robot,'_wait_observation',lambda **kw:stop != 'observation')
+    request=program_goal()
+    assert robot.sequence_goal_callback(request) == GoalResponse.ACCEPT
+    h=handle(request);h.publish_feedback=Mock()
+    result=robot.sequence_execute_callback(h)
+    assert not result.success and len(calls) == 1 and not robot._busy
+    assert result.completed_steps == (1 if stop in ('cancel','observation') else 0)
+    (h.canceled if stop == 'cancel' else h.abort).assert_called_once()
+    h.succeed.assert_not_called()
+
+
+def test_program_rejects_invalid_tail_before_any_motion(robot,monkeypatch):
+    robot._prepared=True
+    motion=Mock(side_effect=AssertionError('no motion on invalid tail'))
+    monkeypatch.setattr(robot,'execute_color_step',motion)
+    for request in [program_goal(('white','red'),('orange','white')),
+                    program_goal(('white','white'),('orange','white')),
+                    program_goal(('white',),('orange',)), program_goal(('white','red'),('box',))]:
+        assert robot.sequence_goal_callback(request) == GoalResponse.REJECT
+    motion.assert_not_called()
+    assert not robot._busy
+
+
+def test_web_parses_with_measured_holding_context(monkeypatch):
+    web,fake=web_fixture(monkeypatch)
+    fake.prepared=True;fake.held_color='white'
+    async def run():
+        assert (await web.handle_text('把白色方块放到橙色方块上'))['ok']
+        assert web.state['parsed'] == {'action':'place','source_color':'white','destination_color':'orange'}
+        await web._job
+        assert fake.calls == [('white','orange')]
+    asyncio.run(run())
+
+
+def test_web_program_submits_one_goal_and_rejects_invalid_tail(monkeypatch):
+    web,fake=web_fixture(monkeypatch)
+    fake.prepared=True
+    fake.send_task_sequence=Mock(return_value={'success':True,'message':'完成','completed_steps':2})
+    async def run():
+        assert not (await web.handle_text('把白色方块放到橙色方块上，然后再拿起来放到白色方块上'))['ok']
+        fake.send_task_sequence.assert_not_called()
+        assert (await web.handle_text('把白色方块放到橙色方块上，然后再拿起来放到红色方块上'))['ok']
+        await web._job
+        fake.send_task_sequence.assert_called_once()
+        assert fake.send_task_sequence.call_args.kwargs['cancel_event'] is web._job_cancel
+        assert fake.calls == []
+        fake.send_task_sequence.reset_mock()
+        assert not (await web.dispatch({'action':'task_sequence','tasks':[
+            {'action':'pick_place','target_color':'white','destination_color':'orange'},
+            {'action':'release'}]}))['ok']
+        fake.send_task_sequence.assert_not_called()
+    asyncio.run(run())
+
+
+def test_web_cancel_before_worker_starts_preserves_event(monkeypatch):
+    web,fake=web_fixture(monkeypatch)
+    fake.prepared=True
+    def send(tasks,cancel_event):
+        assert cancel_event.is_set()
+        return {'success':False,'message':'已取消','completed_steps':0}
+    fake.send_task_sequence=Mock(side_effect=send)
+    async def run():
+        assert (await web.handle_text('把白块放橙块上，然后再拿起来放红块上'))['ok']
+        assert (await web.dispatch({'action':'cancel'}))['ok']
+        await web._job
+        assert not web.state['last_result']['success']
+    asyncio.run(run())
+
+
+def test_real_bridge_program_dry_run_and_prestart_cancel(monkeypatch):
+    from x5a_web_agent.wrist_bridge import WristBridge
+    bridge=WristBridge(dry_run=True)
+    bridge.prepare()
+    tasks=[{'action':'pick_place','target_color':'white','destination_color':'orange'},
+           {'action':'pick_place','target_color':'white','destination_color':'red'}]
+    cancelled=threading.Event();cancelled.set()
+    step=Mock(wraps=bridge._dry_color_step)
+    monkeypatch.setattr(bridge,'_dry_color_step',step)
+    assert bridge.send_task_sequence(tasks,cancelled)['completed_steps'] == 0
+    step.assert_not_called()
+    assert bridge.send_task_sequence(tasks)['completed_steps'] == 2
+    assert not bridge.state()['holding'] and not bridge.busy
+
+
+def test_bridge_cancels_late_acceptance_and_does_not_report_aborted_success(monkeypatch):
+    from action_msgs.msg import GoalStatus
+    from x5a_web_agent.wrist_bridge import WristBridge
+    from x5a_task_interfaces.action import ColorSequence
+    bridge=WristBridge()
+    cancelled=threading.Event()
+    monkeypatch.setattr(bridge,'state',lambda:{'holding':False})
+    bridge._sequence_client=Mock()
+    bridge._sequence_client.wait_for_server.return_value=True
+    accepted=Mock(accepted=True)
+    def wait(future,timeout):
+        if timeout == 10.:
+            cancelled.set()
+            return accepted
+        return SimpleNamespace(status=GoalStatus.STATUS_ABORTED,result=ColorSequence.Result(success=True,message='异常',completed_steps=1))
+    monkeypatch.setattr(bridge,'_wait',wait)
+    result=bridge.send_task_sequence([
+        {'action':'pick_place','target_color':'white','destination_color':'orange'},
+        {'action':'pick_place','target_color':'white','destination_color':'red'}],cancelled)
+    assert not result['success'] and result['completed_steps'] == 1
+    accepted.cancel_goal_async.assert_called_once()
+
+
+
+def test_color_sequence_ros_roundtrip_without_hardware(robot,monkeypatch):
+    from x5a_web_agent.wrist_bridge import WristBridge
+    robot._prepared=True
+    calls=[]
+    monkeypatch.setattr(robot,'servo_readiness_fault',lambda:'')
+    monkeypatch.setattr(robot,'at_observation',lambda:True)
+    monkeypatch.setattr(robot,'execute_color_step',lambda source,destination:
+        calls.append((source,destination)) or (True,'模拟步骤完成'))
+    monkeypatch.setattr(robot,'_wait_observation',lambda **kw:True)
+    bridge=WristBridge()
+    bridge.start()
+    bridge._executor.add_node(robot)
+    try:
+        result=bridge.send_task_sequence([
+            {'action':'pick_place','target_color':'white','destination_color':'orange'},
+            {'action':'pick_place','target_color':'white','destination_color':'red'}])
+        assert result['success'] and result['completed_steps'] == 2
+        assert calls == [('white','orange'),('white','red')]
+    finally:
+        bridge._executor.remove_node(robot)
+        bridge.shutdown()
+
+
+
+def test_named_place_api_preserves_expected_source_and_rejects_mismatch(monkeypatch):
+    web,fake=web_fixture(monkeypatch)
+    fake.prepared=True;fake.held_color='red'
+    async def run():
+        result=await web.task(web.TaskIn(action='place',source_color='white',destination_color='orange'))
+        assert result.status_code == 409
+        assert not fake.calls and web._job is None
+    asyncio.run(run())

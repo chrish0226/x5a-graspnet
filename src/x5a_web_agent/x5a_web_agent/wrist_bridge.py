@@ -9,7 +9,9 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
-from x5a_task_interfaces.action import X5aPickPlace
+from x5a_task_interfaces.action import X5aPickPlace, ColorSequence
+from action_msgs.msg import GoalStatus
+from x5a_pick_place.color_sequence import color_step_pairs
 
 
 class WristBridge:
@@ -17,6 +19,7 @@ class WristBridge:
         self.dry_run = dry_run
         self._prepared = False
         self._held_color = None
+        self._last_moved_color = self._last_support_color = None
         self._server_busy = False
         self._lock = threading.Lock()
         self._active = False
@@ -25,6 +28,7 @@ class WristBridge:
         self._stage_cb = None
         self._node = None
         self._owned = False
+        self._cancel_event = threading.Event()
 
     def start(self):
         if not rclpy.ok():
@@ -33,6 +37,7 @@ class WristBridge:
         self._node = Node('wrist_voice_agent')
         cb = ReentrantCallbackGroup()
         self._client = ActionClient(self._node, X5aPickPlace, '/wrist_pick/pick_place', callback_group=cb)
+        self._sequence_client = ActionClient(self._node, ColorSequence, '/wrist_pick/color_sequence', callback_group=cb)
         self._services = {name: self._node.create_client(Trigger, '/wrist_pick/' + name, callback_group=cb)
                           for name in ('prepare', 'prepare_current', 'prepare_mirror', 'go_home', 'state', 'cancel', 'release',
                                        'place_box', 'place_red', 'place_white', 'place_orange')}
@@ -88,7 +93,8 @@ class WristBridge:
         if self.dry_run:
             return {'server_ready': True, 'prepared': self._prepared, 'initialized':self._prepared,
                     'busy': self.busy, 'holding': self._held_color is not None,
-                    'holding_color':self._held_color, 'placement_ready':self._held_color is not None}
+                    'holding_color':self._held_color, 'placement_ready':self._held_color is not None,
+                    'last_moved_color':self._last_moved_color, 'last_support_color':self._last_support_color}
         try:
             reply = self._call('state', 1.0)
             if not reply['success']:
@@ -152,11 +158,7 @@ class WristBridge:
             return {'success': False, 'message': '放置目标必须是盒子或另一种颜色的方块'}
         def run():
             if self.dry_run:
-                if self._prepared:
-                    self._held_color = color if destination_color == 'hold' else None
-                return {'success': self._prepared,
-                        'message': ('演练：仅抓取并等待放置，未发送运动指令' if destination_color == 'hold'
-                                    else '演练：颜色抓放，未发送运动指令') if self._prepared else '请先说“准备”'}
+                return self._dry_color_step(color, destination_color)
             if not self._client.wait_for_server(timeout_sec=1.0):
                 return {'success': False, 'message': '腕部抓放服务未就绪'}
             goal = X5aPickPlace.Goal()
@@ -191,6 +193,70 @@ class WristBridge:
         # One ROS goal holds robot ownership across every item and cancellation.
         return self.send_pick_place(colors[0], target_colors=colors)
 
+    def _dry_color_step(self, color, destination):
+        if not self._prepared:
+            return {'success': False, 'message': '请先说“准备”'}
+        if self._held_color and self._held_color != color:
+            return {'success': False, 'message': '当前夹着另一颜色，请先放置当前方块'}
+        self._held_color = color if destination == 'hold' else None
+        if destination != 'hold':
+            self._last_moved_color = color
+            self._last_support_color = destination if destination in ('red', 'white', 'orange') else None
+        return {'success': True, 'message': '演练：颜色抓放，未发送运动指令'}
+
+    def send_task_sequence(self, tasks, cancel_event=None):
+        # The web owner creates this before scheduling its worker: cancellation
+        # during startup must not be erased by a late worker.
+        cancelled = cancel_event if cancel_event is not None else threading.Event()
+        def run():
+            self._cancel_event = cancelled
+            if cancelled.is_set():
+                return {'success': False, 'message': '连续任务已取消', 'completed_steps': 0}
+            snapshot = self.state()
+            if snapshot.get('holding') and not snapshot.get('holding_color'):
+                return {'success': False, 'message': '持物颜色未确认，未开始连续任务'}
+            pairs = color_step_pairs(tasks, snapshot.get('holding_color') if snapshot.get('holding') else None)
+            if len(pairs) < 2:
+                return {'success': False, 'message': '连续指令至少需要两步'}
+            if cancelled.is_set():
+                return {'success': False, 'message': '连续任务已取消', 'completed_steps': 0}
+            if self.dry_run:
+                completed = 0
+                for source, destination in pairs:
+                    if cancelled.is_set():
+                        return {'success': False, 'message': '连续任务已取消', 'completed_steps': completed}
+                    result = self._dry_color_step(source, destination)
+                    if not result['success']:
+                        return {**result, 'completed_steps': completed}
+                    completed += 1
+                return {'success': True, 'message': f'演练：连续 {completed} 步完成，未发送运动指令', 'completed_steps': completed}
+            if not self._sequence_client.wait_for_server(timeout_sec=1.):
+                return {'success': False, 'message': '连续抓放服务未就绪，请重新启动本工作区以加载新接口'}
+            if cancelled.is_set():
+                return {'success': False, 'message': '连续任务已取消', 'completed_steps': 0}
+            goal = ColorSequence.Goal(source_colors=[s for s, d in pairs], destination_colors=[d for s, d in pairs])
+            future = self._sequence_client.send_goal_async(goal)
+            self._pending = future
+            try:
+                self._goal = self._wait(future, 10.)
+            except TimeoutError:
+                future.add_done_callback(lambda f: f.result().cancel_goal_async() if f.result() and f.result().accepted else None)
+                raise
+            if not self._goal or not self._goal.accepted:
+                return {'success': False, 'message': '连续任务被拒绝：请确认准备、持物和机械臂反馈状态'}
+            if cancelled.is_set():
+                self._goal.cancel_goal_async()
+            self._pending = self._goal.get_result_async()
+            try:
+                wrapped = self._wait(self._pending, 720.*len(pairs))
+            except TimeoutError:
+                self._goal.cancel_goal_async()
+                raise
+            self._goal = None
+            return {'success': wrapped.status == GoalStatus.STATUS_SUCCEEDED and bool(wrapped.result.success),
+                    'message': wrapped.result.message, 'completed_steps': wrapped.result.completed_steps}
+        return self._operate(run)
+
     def send_pick(self, color):
         return self.send_pick_place(color, destination_color='hold')
 
@@ -203,12 +269,12 @@ class WristBridge:
                     return {'success':False,'message':'当前没有夹持方块，请先抓取'}
                 if self._held_color == destination_color:
                     return {'success':False,'message':'放置目标必须是另一种颜色'}
-                self._held_color = None
-                return {'success':True,'message':'演练：放置当前夹持的方块，未发送运动指令'}
+                return self._dry_color_step(self._held_color, destination_color)
             return self._call('place_' + destination_color, 240.0)
         return self._operate(run)
 
     def cancel(self):
+        self._cancel_event.set()
         if self.dry_run:
             self._prepared = False
             return {'success': True, 'message': '演练：取消指令已解析'}

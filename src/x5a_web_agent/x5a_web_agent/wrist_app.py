@@ -18,6 +18,7 @@ from x5a_web_agent.asr import SenseVoiceSpeechToText, WhisperSpeechToText, creat
 from x5a_web_agent.terminal import TerminalBackend, TerminalConsole
 from x5a_web_agent.wrist_bridge import WristBridge
 from x5a_web_agent.wrist_commands import parse_wrist_command
+from x5a_pick_place.color_sequence import color_step_pairs, MAX_COLOR_STEPS
 
 STAGE_ZH = {
     'SELECTING_BUFFER': '正在为当前目标寻找空闲、可达的暂放位置',
@@ -49,6 +50,7 @@ state = {'stage': 'IDLE', 'stage_zh': STAGE_ZH['IDLE'], 'busy': False,
 clients = set()
 observers = []
 _job = None
+_job_cancel = None
 _submission_lock = asyncio.Lock()
 
 
@@ -59,6 +61,7 @@ class TextIn(BaseModel):
 class TaskIn(BaseModel):
     action: str = 'pick_place'
     target_color: str = ''
+    source_color: str = ''
     destination_color: str = 'box'
     observation_side: str = ''
     tasks: list = []
@@ -77,6 +80,8 @@ async def broadcast(payload):
 async def update(**values):
     state.update(values)
     state['stage_zh'] = STAGE_ZH.get(state['stage'], state['stage'])
+    if state.get('busy') and state.get('sequence_total') and not state['stage_zh'].startswith('第'):
+        state['stage_zh'] = f"第 {state.get('sequence_step', 0)}/{state['sequence_total']} 步：" + state['stage_zh']
     if not state.get('busy'):
         if state['stage'] == 'IDLE' and state.get('last_result') is None:
             # The installed Android app retains its old error when message is null.
@@ -182,7 +187,7 @@ async def refresh():
     return state
 
 
-async def _run(task):
+async def _run(task, cancel_event=None):
     action = task['action']
     try:
         if action == 'pick_place':
@@ -191,7 +196,12 @@ async def _run(task):
         elif action == 'pick':
             result = await asyncio.to_thread(bridge.send_pick, task['target_color'])
         elif action == 'place':
-            result = await asyncio.to_thread(bridge.place, task['destination_color'])
+            if task.get('source_color'):
+                result = await asyncio.to_thread(bridge.send_pick_place, task['source_color'], destination_color=task['destination_color'])
+            else:
+                result = await asyncio.to_thread(bridge.place, task['destination_color'])
+        elif action == 'task_sequence':
+            result = await asyncio.to_thread(bridge.send_task_sequence, task['tasks'], cancel_event=cancel_event)
         elif action == 'sequence':
             result = await asyncio.to_thread(bridge.send_sequence, [item['target_color'] for item in task['tasks']])
         elif action == 'prepare' and task.get('observation_side'):
@@ -213,12 +223,13 @@ async def _run(task):
 
 
 async def dispatch(task):
-    global _job
+    global _job, _job_cancel
     action = task.get('action')
     if action in ('help', 'status'):
         if action == 'help':
             message = ('先说“准备”；支持“夹起红色小方块”“把橘色积木放到白色方块上”'
                        '“先抓白块，然后放进盒子”“把三个方块都收进盒子里”'
+                       '“把白块放橙块上，然后再拿起来放到红块上”'
                        '“按橙白红顺序放进盒子”“你拿着什么颜色”“看到了哪些方块”和“停止”。')
             payload = {'ok': True, 'type': 'info', 'message': message}
         else:
@@ -239,6 +250,8 @@ async def dispatch(task):
         await broadcast(payload)
         return payload
     if action == 'cancel':
+        if _job_cancel is not None:
+            _job_cancel.set()
         result = await asyncio.to_thread(bridge.cancel)
         payload = {'ok': bool(result['success']), 'type': 'info', 'message': result['message']}
         await broadcast(payload)
@@ -249,8 +262,10 @@ async def dispatch(task):
                               and item.get('target_color') in ('red', 'white', 'orange')
                               and item.get('destination_color', 'box') == 'box' for item in tasks)
                       and len({item['target_color'] for item in tasks}) == len(tasks))
-    grasp_action = action in ('pick', 'place', 'pick_place', 'sequence')
-    valid = valid_sequence or action in ('release', 'go_home') or (action == 'prepare' and
+    valid_program = (action == 'task_sequence' and isinstance(tasks, list)
+                     and 2 <= len(tasks) <= MAX_COLOR_STEPS)
+    grasp_action = action in ('pick', 'place', 'pick_place', 'sequence', 'task_sequence')
+    valid = valid_program or valid_sequence or action in ('release', 'go_home') or (action == 'prepare' and
              task.get('observation_side', '') in ('', 'current', 'mirror')) or (action == 'pick_place' and
              task.get('target_color') in ('red', 'white', 'orange') and
              task.get('destination_color', 'box') in ('box', 'red', 'white', 'orange') and
@@ -263,7 +278,17 @@ async def dispatch(task):
         return payload
     async with _submission_lock:
         snapshot = await refresh()
-        if snapshot['busy']:
+        program_error = ''
+        if valid_program:
+            try:
+                if snapshot.get('holding') and snapshot.get('holding_color') not in ('red', 'white', 'orange'):
+                    raise ValueError('持物颜色未确认，未开始连续任务')
+                color_step_pairs(tasks, snapshot.get('holding_color') if snapshot.get('holding') else None)
+            except ValueError as exc:
+                program_error = str(exc)
+        if program_error:
+            payload = {'ok': False, 'type': 'error', 'message': program_error}
+        elif snapshot['busy']:
             payload = {'ok': False, 'type': 'error', 'message': '机械臂正在执行任务，请稍后'}
         elif not snapshot.get('server_ready'):
             payload = {'ok': False, 'type': 'error', 'message': '腕部抓放服务未就绪，请先启动抓放服务'}
@@ -273,15 +298,19 @@ async def dispatch(task):
             payload = {'ok': False, 'type': 'error', 'message': '机械臂反馈暂不可用，请恢复反馈后直接重试'}
         elif action == 'place' and not snapshot.get('placement_ready'):
             payload = {'ok':False,'type':'error','message':'当前没有已定位夹持的方块，请先说“抓白色方块”等抓取指令'}
+        elif action == 'place' and task.get('source_color') and task['source_color'] != snapshot.get('holding_color'):
+            payload = {'ok': False, 'type': 'error', 'message': '当前持物与指令中的颜色不同，请重新确认'}
         elif action == 'place' and snapshot.get('holding_color') == task['destination_color']:
             payload = {'ok':False,'type':'error','message':'放置目标必须是盒子或另一种颜色的方块'}
         else:
             await update(busy=True, stage='ACCEPTED', parsed=task, last_result=None)
-            _job = asyncio.create_task(_run(task))
+            _job_cancel = threading.Event()
+            _job = asyncio.create_task(_run(task, _job_cancel))
             labels = {'prepare': '开始移动到观察位', 'release': '正在松开夹爪',
                       'go_home': '开始返回原始收起姿态', 'pick_place': '开始颜色抓取放置',
                       'pick': '开始抓取方块并返回观察位等待', 'place':'开始放置当前夹持的方块',
-                      'sequence': '开始按颜色顺序逐块放进盒子'}
+                      'sequence': '开始按颜色顺序逐块放进盒子',
+                      'task_sequence': f'开始连续抓放，共 {len(tasks or [])} 步'}
             payload = {'ok': True, 'type': 'info', 'message': labels[action], 'parsed': task}
         await broadcast(payload)
         return payload
@@ -289,6 +318,9 @@ async def dispatch(task):
 
 async def handle_text(text):
     task = parse_wrist_command(text)
+    if task.get('action') not in ('cancel', 'help', 'status'):
+        snapshot = await refresh()
+        task = parse_wrist_command(text, context=snapshot)
     await update(transcript=text, parsed=task)
     await broadcast({'type': 'transcript', 'text': text})
     await broadcast({'type': 'parsed', 'result': task})
@@ -315,7 +347,8 @@ async def health():
 
 @app.post('/api/parse')
 async def api_parse(body: TextIn):
-    return {'text': body.text, 'parsed': parse_wrist_command(body.text)}
+    snapshot = await refresh()
+    return {'text': body.text, 'parsed': parse_wrist_command(body.text, context=snapshot)}
 
 
 @app.post('/api/command')
@@ -361,6 +394,7 @@ async def websocket(ws: WebSocket):
             elif kind in ('task', 'manual_task'):
                 await dispatch({'action': message.get('action', 'pick_place'),
                                 'target_color': message.get('target_color'),
+                                'source_color': message.get('source_color', ''),
                                 'destination_color': message.get('destination_color', 'box'),
                                 'tasks': message.get('tasks', [])})
             elif kind == 'cancel':

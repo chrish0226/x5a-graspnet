@@ -22,6 +22,8 @@ from rosidl_runtime_py.set_message import set_message_fields
 from x5a_pick_place.pick_place_node import ALLOWED_COLORS, PickPlaceNode, wrap_pi, pose_to_xyz, quat_to_yaw
 from x5a_pick_place.stacking import held_stack_center, aligned_stack_candidates, tcp_for_object_center
 from x5a_task_interfaces.action import X5aPickPlace
+from x5a_task_interfaces.action import ColorSequence
+from x5a_pick_place.color_sequence import color_step_pairs
 from x5a_task_server.observation_profiles import mirrored_seed, crosses_home_plane
 from x5a_task_server.clearing import ClearingMixin
 from x5a_task_server.scene_memory import SceneMemory
@@ -39,6 +41,8 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
         self._holding = False
         self._forget_held_grasp()
         self._stage = 'IDLE'
+        self._sequence_step = self._sequence_total = 0
+        self._last_moved_color = self._last_support_color = None
         self._restore_pending = False
         self._restore_future = None
         self._image_stamp = 0
@@ -103,6 +107,10 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
         self._action = ActionServer(
             self, X5aPickPlace, str(self.get_parameter('task.action_name').value),
             execute_callback=self.execute_callback, goal_callback=self.goal_callback,
+            cancel_callback=self.cancel_callback, callback_group=self._callbacks)
+        self._sequence_action = ActionServer(
+            self, ColorSequence, '/wrist_pick/color_sequence',
+            execute_callback=self.sequence_execute_callback, goal_callback=self.sequence_goal_callback,
             cancel_callback=self.cancel_callback, callback_group=self._callbacks)
         for name, callback in [('prepare', self.prepare_callback), ('prepare_current', self.prepare_current_callback),
                                ('prepare_mirror', self.prepare_mirror_callback), ('go_home', self.home_callback), ('state', self.state_callback),
@@ -238,6 +246,8 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
     def on_object_placed(self, color, center, destination):
         if color not in ALLOWED_COLORS:
             return
+        self._last_moved_color = color
+        self._last_support_color = destination if destination in ALLOWED_COLORS else None
         self.scene_memory.moved(color)
         if destination in ALLOWED_COLORS:
             self.scene_memory.record_stack(color, destination, center, self.obj_sz, self.stack_clearance,
@@ -320,6 +330,10 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
             'busy': busy, 'prepared': prepared and not busy and self.at_observation(),
             'holding': self._holding, 'stage': self._stage, 'plan_only': self.plan_only,
             'holding_color': self._held_color if self._holding else None,
+            'last_moved_color': self._last_moved_color,
+            'last_support_color': self._last_support_color,
+            'sequence_step': self._sequence_step,
+            'sequence_total': self._sequence_total,
             'holding_label': {'red':'红块','white':'白块','orange':'橙块'}.get(self._held_color) if self._holding else None,
             'placement_ready': self.placement_ready(),
             'held_grasp': self.held_grasp_snapshot(),
@@ -575,11 +589,7 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
                             feedback.stage = f'队列 {index+1}/{len(colors)}：{names[color]}放进盒子'
                             handle.publish_feedback(feedback)
                             self.report_stage(feedback.stage)
-                        kwargs = ({'pick_only': True} if destination == 'hold' else
-                                  {'destination_color': destination} if destination != 'box' else {})
-                        ok, message = self.clear_target_if_needed(color)
-                        if ok:
-                            ok, message = self.execute_pick_place(color, **kwargs)
+                        ok, message = self.execute_color_step(color, destination)
                         if ok:
                             completed.append(names[color])
                             if not self.plan_only and not self._wait_observation(require_image=False):
@@ -601,10 +611,100 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
                 handle.abort()
             result.success, result.message = ok, message
         except Exception as exc:
+            ok = False
             result.success, result.message = False, f'抓放失败：{exc}'
             handle.abort()
         finally:
             self.log_stage('TASK_RESULT', success=bool(result.success), message=result.message)
+            self._finish(ok)
+        return result
+
+    def execute_color_step(self, color, destination):
+        """An explicit name of the held cube means place, never regrasp it."""
+        if self._holding:
+            if not self.placement_ready():
+                return False, '持物颜色或夹持几何未确认，请先检查当前夹爪状态'
+            if color != self._held_color:
+                return False, '当前夹着另一颜色，请先放置当前方块'
+            if destination == 'hold':
+                return True, '当前已夹持指定方块，等待放置指令'
+            return self.execute_held_placement(destination)
+        kwargs = ({'pick_only': True} if destination == 'hold' else
+                  {'destination_color': destination} if destination != 'box' else {})
+        ok, message = self.clear_target_if_needed(color)
+        return self.execute_pick_place(color, **kwargs) if ok else (False, message)
+
+    @staticmethod
+    def sequence_tasks(request):
+        if len(request.source_colors) != len(request.destination_colors):
+            raise ValueError('连续指令的来源和目标数量不一致')
+        tasks = [{'action': 'pick_place', 'target_color': source, 'destination_color': destination}
+                 for source, destination in zip(request.source_colors, request.destination_colors)]
+        if len(tasks) < 2:
+            raise ValueError('连续指令至少需要两步')
+        return tasks
+
+    def sequence_goal_callback(self, request):
+        try:
+            color_step_pairs(self.sequence_tasks(request), self._held_color if self._holding else None)
+        except ValueError as exc:
+            self.get_logger().warn('rejecting colour sequence: '+str(exc))
+            return GoalResponse.REJECT
+        with self._busy_lock:
+            if (self._busy or self._restore_pending or not self._prepared or self.servo_readiness_fault()
+                    or (self._holding and not self.placement_ready())):
+                return GoalResponse.REJECT
+            self._busy, self._cancel_requested = True, False
+        self._publish_status()
+        return GoalResponse.ACCEPT
+
+    def sequence_execute_callback(self, handle):
+        result = ColorSequence.Result()
+        ok, message = False, '连续指令未执行'
+        try:
+            pairs = color_step_pairs(self.sequence_tasks(handle.request), self._held_color if self._holding else None)
+            self._sequence_total = len(pairs)
+            names = {'red': '红块', 'white': '白块', 'orange': '橙块', 'box': '盒子', 'hold': '夹持等待'}
+            for index, (source, destination) in enumerate(pairs, 1):
+                self._sequence_step = index
+                if handle.is_cancel_requested or self._cancelled():
+                    ok, message = False, '任务已取消'
+                    break
+                if self.servo_readiness_fault():
+                    ok, message = False, self.servo_readiness_fault()
+                    break
+                feedback = ColorSequence.Feedback(step_index=index, step_total=len(pairs),
+                    stage=f'第 {index}/{len(pairs)} 步：{names[source]} → {names[destination]}')
+                handle.publish_feedback(feedback)
+                self.report_stage(feedback.stage)
+                if not self.at_observation() and not (self.move_initial_observation(observe_target=False) and self._wait_observation()):
+                    ok, message = False, '返回观察位失败'
+                    break
+                ok, message = self.execute_color_step(source, destination)
+                if not ok:
+                    break
+                result.completed_steps = index
+                if not self.plan_only and not self._wait_observation(require_image=index < len(pairs)):
+                    ok, message = False, '本步已完成，但未确认观察位或新画面'
+                    break
+            if handle.is_cancel_requested or self._cancelled():
+                ok, message = False, '任务已取消'
+                handle.canceled()
+            elif ok:
+                message = f'连续 {len(pairs)} 步全部完成'
+                handle.succeed()
+            else:
+                handle.abort()
+            if not ok:
+                message = f'队列停止于第 {self._sequence_step}/{len(pairs)} 步；已完成 {result.completed_steps} 步。{message}'
+            result.success, result.message = ok, message
+        except Exception as exc:
+            ok = False
+            result.success, result.message = False, f'连续指令失败：{exc}'
+            handle.abort()
+        finally:
+            self.log_stage('SEQUENCE_RESULT', success=bool(result.success), completed=result.completed_steps, message=result.message)
+            self._sequence_step = self._sequence_total = 0
             self._finish(ok)
         return result
 

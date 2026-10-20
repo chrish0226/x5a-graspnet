@@ -215,6 +215,29 @@ async def _run(task):
 async def dispatch(task):
     global _job
     action = task.get('action')
+    if action in ('help', 'status'):
+        if action == 'help':
+            message = ('先说“准备”；支持“夹起红色小方块”“把橘色积木放到白色方块上”'
+                       '“先抓白块，然后放进盒子”“把三个方块都收进盒子里”'
+                       '“按橙白红顺序放进盒子”“你拿着什么颜色”“看到了哪些方块”和“停止”。')
+            payload = {'ok': True, 'type': 'info', 'message': message}
+        else:
+            snapshot = dict(await refresh())
+            labels = {'red': '红块', 'white': '白块', 'orange': '橙块'}
+            query = task.get('query', 'all')
+            if query == 'holding':
+                held = snapshot.get('holding')
+                message = ('当前夹着' + labels.get(snapshot.get('holding_color'), '方块') if held else
+                           '当前没有夹持方块' if held is False else '当前持物状态不可用，请检查服务连接')
+            elif query == 'vision':
+                vision = snapshot.get('vision', {})
+                message = '；'.join(label + '：' + vision.get(color, {}).get('status_zh', '尚无定位')
+                                   for color, label in labels.items())
+            else:
+                message = snapshot.get('stage_zh') or STAGE_ZH.get(snapshot.get('stage'), '状态未就绪')
+            payload = {'ok': True, 'type': 'info', 'message': message, 'state': snapshot}
+        await broadcast(payload)
+        return payload
     if action == 'cancel':
         result = await asyncio.to_thread(bridge.cancel)
         payload = {'ok': bool(result['success']), 'type': 'info', 'message': result['message']}

@@ -61,11 +61,17 @@
 
     <section class="manual">
       <span class="label">“抓白色”只抓起并等待；“放到红色上”放置；完整一句可直接抓放</span>
+      <p class="fineprint">也可以说“夹起橘色小方块”“按橙白红顺序放进盒子”“你拿着什么颜色”。</p>
       <div class="colors">
         <button type="button" data-command="当前侧准备" class="swatch">当前侧准备</button>
         <button type="button" data-command="镜像侧准备" class="swatch">镜像侧准备</button>
         <button type="button" data-command="回原点" class="swatch">回零位</button>
         <button type="button" data-command="松开夹爪" class="swatch">松开夹爪</button>
+      </div>
+      <div class="colors">
+        <button type="button" data-command="看到了哪些方块" class="swatch">识别情况</button>
+        <button type="button" data-command="你拿着什么颜色" class="swatch">持物颜色</button>
+        <button type="button" data-command="帮助" class="swatch">语音示例</button>
       </div>
       <button id="stopBtn" type="button" class="stop">停止当前任务</button>
       <p class="fineprint">停止按钮只取消任务层，不会代替机械臂底层急停。</p>

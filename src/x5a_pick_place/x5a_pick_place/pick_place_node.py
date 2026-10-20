@@ -243,6 +243,8 @@ class PickPlaceNode(Node):
         self.declare_parameter("execution.action_name", "/execute_trajectory")
         self.declare_parameter("execution.timeout", 120.0)
         self.declare_parameter("execution.require_servo_bounds", False)
+        self.declare_parameter('execution.feedback_bound_tolerance_rad', 0.0)
+        self.declare_parameter('planning.pregrasp_candidate_batch_size', 3)
         self.declare_parameter("execution.min_held_gap_m", 0.0)
         self.declare_parameter("execution.joint_lower", [-3.14, -0.05, -0.1, -1.28, -1.57, -2.0])
         self.declare_parameter("execution.joint_upper", [2.618, 3.5, 3.2, 1.55, 1.57, 2.0])
@@ -346,6 +348,12 @@ class PickPlaceNode(Node):
         self.execute_action = str(g("execution.action_name").value)
         self.execution_timeout = float(g("execution.timeout").value)
         self.require_servo_bounds = bool(g("execution.require_servo_bounds").value)
+        self.feedback_bound_tolerance = float(g('execution.feedback_bound_tolerance_rad').value)
+        self.pregrasp_candidate_batch_size = int(g('planning.pregrasp_candidate_batch_size').value)
+        if not math.isfinite(self.feedback_bound_tolerance) or not 0.0 <= self.feedback_bound_tolerance <= .02:
+            raise ValueError('feedback bound tolerance must be within 0..0.02 rad')
+        if not 1 <= self.pregrasp_candidate_batch_size <= 3:
+            raise ValueError('pregrasp candidate batch size must be within 1..3')
         self.min_held_gap = float(g("execution.min_held_gap_m").value)
         self.servo_lower = list(g("execution.joint_lower").value)
         self.servo_upper = list(g("execution.joint_upper").value)
@@ -736,7 +744,17 @@ class PickPlaceNode(Node):
     def servo_readiness_fault(self) -> str:
         if time.monotonic() - self.joint_state_arrival > 0.5:
             return "stale joint feedback"
-        return self.servo_bounds_fault(self.q)
+        fault = self.servo_bounds_fault(self.q)
+        tolerance = getattr(self, 'feedback_bound_tolerance', 0.0)
+        # Measured endpoint noise has a small advisory band. Commanded paths
+        # still go through the strict bounds check above, without this band.
+        if (fault and tolerance > 0.0 and self.q is not None and len(self.q) == 6
+                and all(math.isfinite(v) and lo-tolerance <= v <= hi+tolerance
+                        for v, lo, hi in zip(self.q, self.servo_lower, self.servo_upper))):
+            self._servo_feedback_advisory = fault
+            return ''
+        self._servo_feedback_advisory = ''
+        return fault
 
     def publish_box(
         self,
@@ -1147,6 +1165,10 @@ class PickPlaceNode(Node):
 
 
     def planning_start_joints(self) -> List[float]:
+        # Real execution starts from fresh measured joints; the cached virtual
+        # endpoint is only authoritative when planning without robot movement.
+        if not self.plan_only and self.q is not None and time.monotonic()-self.joint_state_arrival <= .5:
+            return list(self.q)
         if self.last_joints is not None:
             return list(self.last_joints)
         if self.q is not None:
@@ -1408,37 +1430,38 @@ class PickPlaceNode(Node):
 
     def move_pregrasp_candidates(self, x, y, z, orientations, hover_height):
         """Reject unusable approaches before moving to an observation pose."""
-        candidates = []
-        restored = False
-        try:
-            if not self.set_preflight_target_present(False):
-                return None
-            for index, rpy in enumerate(orientations):
-                if self._cancelled():
-                    break
-                backoff = self.reobserve_backoff if self.reobserve_enabled else 0.0
-                hover = self.pose_rpy(x-backoff*math.cos(rpy[2]),
-                                      y-backoff*math.sin(rpy[2]),
-                                      z+hover_height, rpy)
-                joints = self.ik_joints_for_pose(hover)
-                if joints is None:
-                    continue
-                contact = self.pose_rpy(x, y, z, rpy)
-                if self.precheck_approach_path(joints, contact):
-                    candidates.append((index, list(rpy), joints))
-                    if len(candidates) >= 3:
+        remaining = iter(enumerate(orientations))
+        batch_size = getattr(self, 'pregrasp_candidate_batch_size', 3)
+        while not self._cancelled():
+            candidates = []
+            restored = False
+            try:
+                if not self.set_preflight_target_present(False):
+                    return None
+                for index, rpy in remaining:
+                    if self._cancelled():
                         break
-        finally:
-            # Free-space transit must still avoid the target cube. If restoring
-            # it fails, no hardware trajectory is permitted.
-            restored = self.set_preflight_target_present(True)
-        if not restored or self._cancelled():
-            return None
-        for index, rpy, joints in candidates:
-            self.log_stage('PREGRASP_SELECTED', rpy=rpy, approach_prechecked=True)
-            if self.move_joints(joints, f'MOVE_PRE_GRASP_{index+1}_IK',
-                                self.transit_vel, self.transit_acc):
-                return rpy
+                    backoff = self.reobserve_backoff if self.reobserve_enabled else 0.0
+                    hover = self.pose_rpy(x-backoff*math.cos(rpy[2]),
+                                          y-backoff*math.sin(rpy[2]), z+hover_height, rpy)
+                    joints = self.ik_joints_for_pose(hover)
+                    if joints is None:
+                        continue
+                    contact = self.pose_rpy(x, y, z, rpy)
+                    if self.precheck_approach_path(joints, contact):
+                        candidates.append((index, list(rpy), joints))
+                        if len(candidates) >= batch_size:
+                            break
+            finally:
+                # Restore the target before any transit, including exceptions.
+                restored = self.set_preflight_target_present(True)
+            if not restored or self._cancelled() or not candidates:
+                return None
+            for index, rpy, joints in candidates:
+                self.log_stage('PREGRASP_SELECTED', rpy=rpy, approach_prechecked=True)
+                if self.move_joints(joints, f'MOVE_PRE_GRASP_{index+1}_IK',
+                                    self.transit_vel, self.transit_acc):
+                    return rpy
         return None
 
     def place_orientation_candidates(self, x: float, y: float) -> List[List[float]]:

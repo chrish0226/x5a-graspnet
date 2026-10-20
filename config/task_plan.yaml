@@ -7,15 +7,16 @@
       tcp_frame: wrist_preview/tool0
       transit_velocity_scaling: 0.82
       transit_acceleration_scaling: 0.43
-      precision_velocity_scaling: 0.33
-      precision_acceleration_scaling: 0.19
-      lift_retreat_velocity_scaling: 0.4
-      lift_retreat_acceleration_scaling: 0.24
-      planning_time: 5.0
-      max_attempts: 6
+      precision_velocity_scaling: 0.45
+      precision_acceleration_scaling: 0.25
+      lift_retreat_velocity_scaling: 0.55
+      lift_retreat_acceleration_scaling: 0.32
+      planning_time: 3.0
+      max_attempts: 4
       use_tf_tcp: true
       joint_goal_tolerance_rad: 0.003
       precheck_approach: true
+      pregrasp_candidate_batch_size: 1
     grasp_orientation_rpy:
     - 0.0
     - 1.1
@@ -28,6 +29,8 @@
       action_name: /wrist_pick/execute_trajectory
       timeout: 120.0
       require_servo_bounds: true
+      # Only measured feedback has a small advisory band; trajectory limits stay strict.
+      feedback_bound_tolerance_rad: 0.015
       min_held_gap_m: 0.004
     state:
       joint_state_topic: /wrist_preview/joint_states
@@ -110,6 +113,9 @@
     - -1.0362787246704102
     - 0.051690101623535156
     - 0.06389713287353516
+    wrist:
+      table_collision_offset_m: -0.005
+      observation_tolerance_rad: 0.06
     pre_grasp_ready_joints:
     - 0.72
     - 0.85

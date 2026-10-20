@@ -4,23 +4,25 @@
 
 ## 回归测试
 
+2026-10-20 颜色流程优化后，完整回归为 **622 passed，3 warnings（16.31 s）**：
+
 ```bash
 source scripts/env.bash
 X5A_TEST_ROS_DOMAIN_ID=157 /usr/bin/python3 -m pytest -q \
   src/x5a_remote_grasp/test src/x5a_web_agent/test src/x5a_pick_place/test tests \
-  --disable-warnings
-```
-
-2026-10-20 上传前重跑结果为 **486 passed，3 warnings**。它覆盖所列目录，不代表所有源包或硬件均测试通过。方块换面新增测试覆盖 24 个唯一旋转、平面支撑、边方向、底面高度、居中和非立方体拒绝。2026-10-17 的 `colcon build --symlink-install --packages-select x5a_remote_grasp` 已通过。
-
-同日补跑颜色视觉、RGB-D、顶面/盒沿和标定测试：
-
-```bash
-X5A_TEST_ROS_DOMAIN_ID=157 /usr/bin/python3 -m pytest -q \
   src/x5a_vision/test src/x5a_handeye/test --disable-warnings
 ```
 
-结果 **77 passed，1 warning**；两组共 **563 项通过**。颜色流程的 launch 构造、规则解析、抓放状态、清障/记忆与视觉算法均有回归覆盖；本次没有启动硬件做纯颜色实机抓取。
+新增回归检查口语、别名、顺序/批量指令、只读查询、歧义拒绝、取消优先，以及惰性候选、场景恢复、实际规划起点、有限反馈容差和桌面模型偏移。原有方块换面、路径、失联、执行中断、清障/场景记忆与视觉/标定测试一起通过。覆盖的是所列目录，不代表所有源包或硬件均测试通过。
+
+相关三包构建通过（仅扫描 src，避免本机备份目录产生重复包）：
+
+```bash
+colcon build --base-paths src --symlink-install \
+  --packages-select x5a_pick_place x5a_task_server x5a_web_agent
+```
+
+原发布基线为 486 项主流程测试加 77 项视觉/标定测试，共 563 项。最新速度设置尚未做新的实机耗时对照；本次没有启动、重启硬件或自动执行抓取。2026-10-17 的 x5a_remote_grasp 构建与方块换面离线验证见下。
 
 测试域由根目录 `conftest.py` 从 `X5A_TEST_ROS_DOMAIN_ID` 设置。离线 MoveIt 回放另使用 localhost DDS 158、模拟关节反馈并禁用执行，没有连接物理控制器。
 

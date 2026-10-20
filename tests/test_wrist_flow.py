@@ -1260,3 +1260,28 @@ def test_http_split_and_complete_flow_on_real_dry_bridge(monkeypatch):
         assert payload['parsed']['action']=='pick_place' and not state['holding']
         payload,state=command('抓白色方块');assert state['holding']
         payload,state=command('放进盒子里');assert not state['holding']
+
+
+def test_table_collision_shift_does_not_change_measured_geometry(robot, monkeypatch):
+    from moveit_msgs.msg import CollisionObject
+    calls=[]
+    monkeypatch.setattr(PickPlaceNode,'publish_box',lambda self,name,xyz,size,**kw:calls.append((name,list(xyz),kw)))
+    measured=robot.table_z
+    for name in ('table','table_mirror'):
+        xyz=[robot.table_x,robot.table_y,measured]
+        robot.publish_box(name,xyz,[.52,.72,.04])
+        assert xyz[2]==measured
+        assert calls[-1][1][2]==pytest.approx(measured-.005)
+        robot.publish_box(name,xyz,[.52,.72,.04],operation=CollisionObject.REMOVE)
+        assert calls[-1][1][2]==measured
+    assert robot.table_z==measured
+
+
+def test_observation_accepts_small_controller_residual_without_changing_joint_limits(robot):
+    robot.q=list(robot.ready_joints)
+    robot.q[0]+=.045
+    assert robot.at_observation()
+    robot.q[0]+=.04
+    assert not robot.at_observation()
+    robot.q[3]=-1.31
+    assert robot.servo_readiness_fault()

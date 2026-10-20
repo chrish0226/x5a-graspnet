@@ -82,3 +82,32 @@ def test_requires_complete_path_and_bounds_uses_actual_open_fingers(fraction,mid
     assert PickPlaceNode.precheck_approach_path(n,[0.]*6,Pose()) == accepted
     assert requests[0].avoid_collisions
     assert list(requests[0].start_state.joint_state.position[-2:]) == [.042,.042]
+
+
+def test_first_valid_candidate_moves_without_evaluating_unused_alternatives():
+    n,calls=candidate_fixture([True])
+    n.pregrasp_candidate_batch_size=1
+    assert PickPlaceNode.move_pregrasp_candidates(n,.2,.3,.044,
+        [[0.,1.1,.2],[0.,1.05,1.57],[0.,1.,0.]],.06)==[0.,1.1,.2]
+    assert [call[0] for call in calls]==['target','target','move']
+
+
+def test_lazy_candidates_continue_after_planning_failure_and_restore_each_scene():
+    n,calls=candidate_fixture([True,True])
+    n.pregrasp_candidate_batch_size=1
+    moves=iter([False,True])
+    n.move_joints=lambda *args:calls.append(('move',args)) or next(moves)
+    assert PickPlaceNode.move_pregrasp_candidates(n,.2,.3,.044,
+        [[0.,1.1,.2],[0.,1.05,1.57]],.06)==[0.,1.05,1.57]
+    assert [call[0] for call in calls]==['target','target','move','target','target','move']
+
+
+def test_lazy_candidates_do_not_retry_after_possible_partial_execution():
+    n,calls=candidate_fixture([True])
+    n.pregrasp_candidate_batch_size=1
+    def interrupted(*args):raise RuntimeError('execution interrupted')
+    n.move_joints=interrupted
+    with pytest.raises(RuntimeError,match='execution interrupted'):
+        PickPlaceNode.move_pregrasp_candidates(n,.2,.3,.044,
+            [[0.,1.1,.2],[0.,1.05,1.57]],.06)
+    assert calls==[('target',False),('target',True)]

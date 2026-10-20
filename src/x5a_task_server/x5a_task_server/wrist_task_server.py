@@ -60,6 +60,14 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
         self._motor_health_arrival = 0.0
         self.declare_parameter('wrist.scene_objects_collision_enabled', True)
         self.scene_objects_collision_enabled = bool(self.get_parameter('wrist.scene_objects_collision_enabled').value)
+        self.declare_parameter('wrist.table_collision_offset_m', 0.0)
+        self.declare_parameter('wrist.observation_tolerance_rad', .03)
+        self.table_collision_offset = float(self.get_parameter('wrist.table_collision_offset_m').value)
+        self.observation_tolerance = float(self.get_parameter('wrist.observation_tolerance_rad').value)
+        if not math.isfinite(self.table_collision_offset) or not -.005 <= self.table_collision_offset <= 0.0:
+            raise ValueError('table collision offset must be within -5..0 mm')
+        if not math.isfinite(self.observation_tolerance) or not .01 <= self.observation_tolerance <= .08:
+            raise ValueError('observation tolerance must be within 0.01..0.08 rad')
         self.declare_parameter('task.action_name', '/wrist_pick/pick_place')
         self.declare_parameter('wrist.prepare_timeout_s', 8.0)
         self.declare_parameter('wrist.home_joints', [0.0]*6)
@@ -266,7 +274,7 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
 
     def at_observation(self):
         return (not self.servo_readiness_fault() and len(self.ready_joints) == 6
-                and all(abs(wrap_pi(a - b)) <= 0.03 for a, b in zip(self.q, self.ready_joints)))
+                and all(abs(wrap_pi(a - b)) <= self.observation_tolerance for a, b in zip(self.q, self.ready_joints)))
 
     def _reserve(self):
         with self._busy_lock:
@@ -321,6 +329,7 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
             'observation_side': self.observation_side,
             'observation_label': '镜像侧' if self.observation_side == 'mirror' else '当前侧',
             'arm_fault': self.servo_readiness_fault(),
+            'joint_feedback_advisory': getattr(self, '_servo_feedback_advisory', ''),
             'arm_health': self._motor_health,
             'vision': self.vision_snapshot(),
             'clearing': self._clearing_details(),
@@ -341,7 +350,7 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
             now = time.monotonic()
             at_target = (self.at_observation() if target is None else
                          not self.servo_readiness_fault() and
-                         all(abs(wrap_pi(a-b)) <= .03 for a, b in zip(self.q, target)))
+                         all(abs(wrap_pi(a-b)) <= self.observation_tolerance for a, b in zip(self.q, target)))
             if not at_target:
                 anchor = None
                 settled = now
@@ -689,6 +698,8 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
         return response
 
     def publish_box(self, name, xyz, size, frame=None, operation=CollisionObject.ADD, yaw=0.0):
+        if name in ('table', 'table_mirror') and operation == CollisionObject.ADD:
+            xyz = [xyz[0], xyz[1], xyz[2] + self.table_collision_offset]
         environment_object = (name in ('object', 'source_support')
                               or name.startswith(('cube_obstacle_', 'box_wall_')))
         if environment_object and not self.scene_objects_collision_enabled and operation == CollisionObject.ADD:

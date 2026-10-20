@@ -691,9 +691,11 @@ def test_complete_stack_uses_measured_offset_keeps_base_cube_and_skips_reobserva
         center = np.array([source[0],source[1],source[2]-.015])
         robot._held_object_offset = tuple(rotation.inv().apply(center-np.array(pose_to_xyz(grasp))))
         return True
-    def move_place(x,y,z,rpys,*args,**kwargs):
-        assert kwargs['xy_offsets'] == [(0.,0.)]
-        return rpys[0]
+    def move_place(center,rpys):
+        from x5a_pick_place.stacking import tcp_for_object_center
+        assert len(rpys)==4
+        np.testing.assert_allclose(center,[.30,.30,.041])
+        return tcp_for_object_center(center,robot._held_object_offset,rpys[0]),rpys[0]
     def vertical(pose,stage,*args):
         motions.append((stage,pose))
         return True, 1.
@@ -707,7 +709,7 @@ def test_complete_stack_uses_measured_offset_keeps_base_cube_and_skips_reobserva
     monkeypatch.setattr(robot,'move_pregrasp_candidates',lambda *args:[0.,1.1,0.])
     monkeypatch.setattr(robot,'correct_pregrasp',lambda *args:pytest.fail('second localization is disabled'))
     monkeypatch.setattr(robot,'attach_object',attach)
-    monkeypatch.setattr(robot,'move_pose_candidates',move_place)
+    monkeypatch.setattr(robot,'move_stack_pre_place',move_place)
     monkeypatch.setattr(robot,'vertical_move',vertical)
     monkeypatch.setattr(robot,'detach_object',lambda xyz:placements.append(xyz))
     monkeypatch.setattr(robot,'move_joints',lambda *args:True)
@@ -1009,6 +1011,12 @@ def split_flow_hardware(robot,monkeypatch):
     monkeypatch.setattr(robot,'attach_object',attach)
     monkeypatch.setattr(robot,'move_joints',lambda *a:calls.append(('joint',a[1])) or True)
     monkeypatch.setattr(robot,'move_pose_candidates',lambda *a,**kw:calls.append(('place_pose',tuple(a[:3]))) or list(a[3][0]))
+    def stack_pre_place(center,orientations):
+        from x5a_pick_place.stacking import tcp_for_object_center
+        xyz=tcp_for_object_center(center,robot._held_object_offset,orientations[0])
+        calls.append(('place_pose',tuple(xyz)))
+        return xyz,orientations[0]
+    monkeypatch.setattr(robot,'move_stack_pre_place',stack_pre_place)
     monkeypatch.setattr(robot,'detach_object',lambda *a:calls.append(('detach',a)))
     monkeypatch.setattr(robot,'_wait_observation',lambda **kw:True)
     robot.set_stage_callback(stages.append)
@@ -1080,6 +1088,7 @@ def test_only_initial_observation_adds_bounded_joint_path_constraints(robot,monk
     robot.plan_only=True;robot.q=[0.]*6;robot.last_joints=None
     assert robot.move_joints(robot.ready_joints,stage,.82,.43)
     assert requests[0].planning_options.plan_only
+    assert requests[0].request.start_state.is_diff
     constraints=requests[0].request.path_constraints.joint_constraints
     assert bool(constraints)==constrained
     if constrained:
@@ -1285,3 +1294,52 @@ def test_observation_accepts_small_controller_residual_without_changing_joint_li
     assert not robot.at_observation()
     robot.q[3]=-1.31
     assert robot.servo_readiness_fault()
+
+
+def test_held_stack_entry_offers_four_centered_alignments(robot,monkeypatch):
+    from x5a_pick_place.stacking import tcp_for_object_center
+    known_held_white(robot)
+    monkeypatch.setattr(robot,'wait_for_placement_target',lambda destination:((.30,.30,.024),2.276))
+    monkeypatch.setattr(robot,'publish_box',lambda *args,**kw:None)
+    calls=[]
+    def place(xyz,orientations,center):
+        assert len(orientations)==4
+        assert tuple(center)==pytest.approx((.30,.30,.041))
+        assert tuple(xyz)==pytest.approx(tcp_for_object_center(center,robot._held_object_offset,orientations[0]))
+        calls.append(orientations)
+        return True,'planned'
+    monkeypatch.setattr(robot,'execute_place_motion',place)
+    assert robot.execute_held_placement('red')[0] and len(calls)==1
+
+
+def test_descent_uses_selected_orientation_tcp_instead_of_first_candidate(robot,monkeypatch):
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+    from x5a_pick_place.pick_place_node import pose_to_xyz
+    from x5a_pick_place.stacking import tcp_for_object_center
+    calls,stages=split_flow_hardware(robot,monkeypatch)
+    known_held_white(robot)
+    robot._held_object_offset=(.03,.01,-.02)
+    held_offset=robot._held_object_offset
+    center=(.30,.30,.041);selected=[0.,1.1,1.57]
+    xyz=tcp_for_object_center(center,robot._held_object_offset,selected)
+    monkeypatch.setattr(robot,'move_stack_pre_place',lambda *args:(xyz,selected))
+    poses=[];original=robot.vertical_move
+    def vertical(pose,stage,*args):
+        if stage=='DESCEND':poses.append(pose)
+        return original(pose,stage,*args)
+    monkeypatch.setattr(robot,'vertical_move',vertical)
+    assert robot.execute_place_motion((.4,.4,.1),[[0.,1.1,0.],selected],center)[0]
+    pose=poses[0];q=pose.orientation
+    np.testing.assert_allclose(pose_to_xyz(pose),xyz,atol=1e-12)
+    actual=np.array(pose_to_xyz(pose))+Rotation.from_quat([q.x,q.y,q.z,q.w]).apply(held_offset)
+    np.testing.assert_allclose(actual,center,atol=1e-12)
+
+
+def test_no_valid_stack_orientation_keeps_holding_and_never_releases(robot,monkeypatch):
+    known_held_white(robot)
+    monkeypatch.setattr(robot,'move_stack_pre_place',lambda *args:None)
+    monkeypatch.setattr(robot,'vertical_move',lambda *args:pytest.fail('must not descend'))
+    monkeypatch.setattr(robot,'call_gripper',lambda *args:pytest.fail('must not release'))
+    assert not robot.execute_place_motion((.30,.30,.081),[[0.,1.1,0.]],(.30,.30,.041))[0]
+    assert robot._holding and robot.placement_ready()

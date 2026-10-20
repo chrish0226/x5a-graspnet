@@ -20,7 +20,7 @@ from moveit_msgs.msg import PlanningScene, CollisionObject
 from moveit_msgs.srv import ApplyPlanningScene
 from rosidl_runtime_py.set_message import set_message_fields
 from x5a_pick_place.pick_place_node import ALLOWED_COLORS, PickPlaceNode, wrap_pi, pose_to_xyz, quat_to_yaw
-from x5a_pick_place.stacking import held_stack_center, aligned_stack_rpy, tcp_for_object_center
+from x5a_pick_place.stacking import held_stack_center, aligned_stack_candidates, tcp_for_object_center
 from x5a_task_interfaces.action import X5aPickPlace
 from x5a_task_server.observation_profiles import mirrored_seed, crosses_home_plane
 from x5a_task_server.clearing import ClearingMixin
@@ -658,7 +658,7 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
         else:
             center = held_stack_center(xyz, (self.obj_sx,self.obj_sy,self.obj_sz),
                                        self.table_z + .5*self.table_sz, self.stack_clearance)
-            orientations = [aligned_stack_rpy(self._held_grasp_rpy, self._held_cube_yaw, yaw)]
+            orientations = aligned_stack_candidates(self._held_grasp_rpy, self._held_cube_yaw, yaw)
             place_xyz = tcp_for_object_center(center, self._held_object_offset, orientations[0])
             self.publish_box('cube_obstacle_' + destination,
                              [xyz[0],xyz[1],xyz[2]-.5*self.obj_sz],

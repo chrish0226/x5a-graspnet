@@ -40,6 +40,15 @@ def aligned_stack_rpy(grasp_rpy, source_yaw, destination_yaw):
     return [grasp_rpy[0], grasp_rpy[1], grasp_rpy[2] + delta]
 
 
+def aligned_stack_candidates(grasp_rpy, source_yaw, destination_yaw):
+    """All four upright square alignments, ordered by tool yaw travel."""
+    nearest = aligned_stack_rpy(grasp_rpy, source_yaw, destination_yaw)
+    wrap = lambda angle: (angle + math.pi) % (2*math.pi) - math.pi
+    candidates = [[nearest[0], nearest[1], wrap(nearest[2] + quarter*math.pi/2)]
+                  for quarter in range(4)]
+    return sorted(candidates, key=lambda rpy: abs(wrap(rpy[2]-grasp_rpy[2])))
+
+
 def held_stack_center(destination_top, size, table_top, clearance=.002):
     """An already lifted cube only needs the destination's current geometry."""
     destination, size = np.asarray(destination_top, float), np.asarray(size, float)

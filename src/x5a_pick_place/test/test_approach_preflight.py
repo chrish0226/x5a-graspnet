@@ -81,6 +81,7 @@ def test_requires_complete_path_and_bounds_uses_actual_open_fingers(fraction,mid
     )
     assert PickPlaceNode.precheck_approach_path(n,[0.]*6,Pose()) == accepted
     assert requests[0].avoid_collisions
+    assert requests[0].start_state.is_diff  # Keep any attached held object.
     assert list(requests[0].start_state.joint_state.position[-2:]) == [.042,.042]
 
 

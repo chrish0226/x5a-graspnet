@@ -18,7 +18,7 @@
 | 不执行动作的检查 | `bash scripts/start_sam.sh --plan-only`：推理与规划 | `bash scripts/start.sh --dry-run`：仅交互，不规划 |
 | 页面 | HTTP 8000 / HTTPS 8443 | HTTP 8001 / HTTPS 8444，另提供旧端口兼容 |
 
-颜色流程已增加口语同义词、三色顺序收纳、持物/识别查询，并优化速度、预抓取候选和 5 mm 桌面碰撞余量，详见[颜色优化与指令示例](docs/COLOR_WORKFLOW.md#2026-10-20-速度与容差优化)。
+颜色流程已增加口语同义词、三色顺序收纳、持物/识别查询、叠放四方向搜索，并优化速度、预抓取候选和 5 mm 桌面碰撞余量，详见[颜色优化与指令示例](docs/COLOR_WORKFLOW.md#2026-10-20-速度与容差优化)。
 
 两种模式共用进程锁，不能同时控制机械臂。SAM 没有移植颜色流程中的镜像准备、自动清障和叠放记忆。详见 [SAM 说明](docs/SAM_WRIST.md)、[颜色流程](docs/COLOR_WORKFLOW.md)。
 
@@ -199,7 +199,7 @@ X5A_TEST_ROS_DOMAIN_ID=157 /usr/bin/python3 -m pytest -q \
   src/x5a_vision/test src/x5a_handeye/test --disable-warnings
 ```
 
-2026-10-20 颜色优化后的完整回归 **622 项通过**。`conftest.py` 从 `X5A_TEST_ROS_DOMAIN_ID` 设置测试域，仅设置 `ROS_DOMAIN_ID` 会被覆盖。保存场景回放、性能测量及实机验证边界见 [验证记录](docs/VALIDATION.md)。
+2026-10-20 颜色优化后的完整回归 **634 项通过**。`conftest.py` 从 `X5A_TEST_ROS_DOMAIN_ID` 设置测试域，仅设置 `ROS_DOMAIN_ID` 会被覆盖。保存场景回放、性能测量及实机验证边界见 [验证记录](docs/VALIDATION.md)。
 
 - 标定留出集最大误差约 4.7 mm，严格 3 mm 验收失败；棱角对齐尚无高精度实机堆叠保证。
 - SAM 持物点云尚未作为完整附着碰撞体覆盖所有运动阶段，其他物体的场景建模也不完整。完整轨迹不代表所有物体与环境接触都已验证。

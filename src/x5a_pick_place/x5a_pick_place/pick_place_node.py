@@ -51,7 +51,7 @@ from tf2_geometry_msgs import do_transform_pose
 from x5a_handeye.x5a_fk import fk_base_tool0
 from x5a_pick_place.reobserve import ReobserveWindow, bounded_correction
 from x5a_pick_place.retiming import scale_cartesian_timing
-from x5a_pick_place.stacking import stack_geometry, tcp_for_object_center, aligned_stack_rpy
+from x5a_pick_place.stacking import stack_geometry, tcp_for_object_center, aligned_stack_candidates
 
 
 ARM_JOINTS = [
@@ -935,6 +935,7 @@ class PickPlaceNode(Node):
         req.max_velocity_scaling_factor = velocity_scaling
         req.max_acceleration_scaling_factor = acceleration_scaling
         rs = RobotState()
+        rs.is_diff = True  # Partial joint update must preserve the held body.
         rs.joint_state.name = list(ARM_JOINTS)
         rs.joint_state.position = self.planning_start_joints()
         req.start_state = rs
@@ -1034,6 +1035,7 @@ class PickPlaceNode(Node):
         req.max_velocity_scaling_factor = velocity_scaling
         req.max_acceleration_scaling_factor = acceleration_scaling
         rs = RobotState()
+        rs.is_diff = True
         rs.joint_state.name = list(ARM_JOINTS)
         rs.joint_state.position = self.planning_start_joints()
         req.start_state = rs
@@ -1108,6 +1110,7 @@ class PickPlaceNode(Node):
         req.jump_threshold = self.jump_threshold
         req.avoid_collisions = True
         start_q = self.planning_start_joints()
+        req.start_state.is_diff = True
         req.start_state.joint_state.name = list(ARM_JOINTS) + ['joint7', 'joint8']
         req.start_state.joint_state.position = start_q + [self.gripper_position]*2
         wp = Pose()
@@ -1231,6 +1234,7 @@ class PickPlaceNode(Node):
         ps.header.stamp = self.get_clock().now().to_msg()
         ps.pose = pose
         req.ik_request.pose_stamped = ps
+        req.ik_request.robot_state.is_diff = True
         req.ik_request.timeout.sec = 0
         req.ik_request.timeout.nanosec = 200000000
         # Collision-aware first, then one collision-unaware pass on the last seed.
@@ -1408,6 +1412,7 @@ class PickPlaceNode(Node):
         req.avoid_collisions = True
         # Include the actual open fingers, which can hit a nearby box rim even
         # when the arm and a closed-gripper IK solution fit.
+        req.start_state.is_diff = True
         req.start_state.joint_state.name = list(ARM_JOINTS) + ['joint7', 'joint8']
         req.start_state.joint_state.position = list(start_q) + [self.gripper_position]*2
         req.waypoints = [contact]
@@ -1888,16 +1893,51 @@ class PickPlaceNode(Node):
     def on_object_placed(self, color, center, destination):
         """Task-server hook after successful release and detachment."""
 
+    def move_stack_pre_place(self, center, orientations):
+        """Try centred square alignments; never move before a full descent check."""
+        for index, rpy in enumerate(orientations, 1):
+            if self._cancelled():
+                return None
+            # The offset rotates with the tool. Reusing the first candidate's
+            # TCP for another yaw would shift the cube away from the support.
+            xyz = tuple(float(v) for v in tcp_for_object_center(center, self._held_object_offset, rpy))
+            hover = self.pose_rpy(xyz[0], xyz[1], xyz[2]+self.pre_place_h, rpy)
+            self.log_stage('STACK_ORIENTATION_TRY', candidate=index, rpy=list(rpy), tcp=xyz)
+            joints = self.ik_joints_for_pose(hover, collision_aware_only=True)
+            if joints is None:
+                self.log_stage('STACK_ORIENTATION_REJECT', candidate=index, reason='pre-place IK failed')
+                continue
+            contact = self.pose_rpy(*xyz, rpy)
+            if not self.precheck_approach_path(joints, contact):
+                self.log_stage('STACK_ORIENTATION_REJECT', candidate=index, reason='incomplete descent')
+                continue
+            if self._cancelled():
+                return None
+            # WristTaskServer raises after any execution interruption; it must
+            # propagate rather than trying another orientation after motion.
+            if self.move_joints(joints, f'MOVE_PRE_PLACE_{index}_IK', self.transit_vel, self.transit_acc):
+                self.log_stage('STACK_ORIENTATION_SELECTED', candidate=index, rpy=list(rpy), tcp=xyz)
+                return xyz, list(rpy)
+        return None
+
     def execute_place_motion(self, place_xyz, place_oris, stack_center=None, skip_return_home=False):
         """Place the already attached cube; never repeat approach or grasp."""
         place_x, place_y, place_z = place_xyz
         stacking = stack_center is not None
         self.report_stage("MOVE_PRE_PLACE")
-        chosen_place = self.move_pose_candidates(
-            place_x, place_y, place_z + self.pre_place_h,
-            place_oris, "MOVE_PRE_PLACE", self.transit_vel, self.transit_acc,
-            xy_offsets=[(0.0, 0.0)] if stacking else [(0.0, 0.0), (0.01, 0.0), (0.0, -0.01)],
-        )
+        if stacking:
+            selected = self.move_stack_pre_place(stack_center, place_oris)
+            chosen_place = None
+            if selected is not None:
+                (place_x, place_y, place_z), chosen_place = selected
+        else:
+            chosen_place = self.move_pose_candidates(
+                place_x, place_y, place_z + self.pre_place_h,
+                place_oris, "MOVE_PRE_PLACE", self.transit_vel, self.transit_acc,
+                xy_offsets=[(0.0, 0.0), (0.01, 0.0), (0.0, -0.01)],
+            )
+        if self._cancelled():
+            return self._fail('任务已取消')
         if chosen_place is None:
             return self._fail("pre-place planning failed")
         place = self.pose_rpy(place_x, place_y, place_z, chosen_place)
@@ -2156,7 +2196,7 @@ class PickPlaceNode(Node):
             name = {'red': '红块', 'white': '白块', 'orange': '橙块'}[color]
             return True, f'已抓起{name}并返回观察位，等待放置指令'
         if stacking:
-            place_oris = [aligned_stack_rpy(chosen_grasp, cube_yaw, self._destination_yaw)]
+            place_oris = aligned_stack_candidates(chosen_grasp, self._held_cube_yaw, self._destination_yaw)
             place_x, place_y, place_z = tcp_for_object_center(
                 stack_center, self._held_object_offset, place_oris[0])
             self.log_stage('STACK_TARGET', destination_color=destination_color,

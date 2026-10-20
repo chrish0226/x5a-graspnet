@@ -1,5 +1,6 @@
+# Conservative limits for optional Pilz LIN/CIRC planning, in m/s and rad/s.
 cartesian_limits:
-  max_trans_vel: 0.5
-  max_trans_acc: 1.0
-  max_trans_dec: -1.0
-  max_rot_vel: 1.0
+  max_trans_vel: 0.10
+  max_trans_acc: 0.20
+  max_trans_dec: -0.20
+  max_rot_vel: 0.50

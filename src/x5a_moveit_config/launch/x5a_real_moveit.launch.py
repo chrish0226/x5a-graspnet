@@ -27,6 +27,9 @@ def generate_launch_description():
     use_rviz = LaunchConfiguration("use_rviz")
     start_driver = LaunchConfiguration("start_driver")
     start_adapter = LaunchConfiguration("start_adapter")
+    start_readonly_feedback = LaunchConfiguration('start_readonly_feedback')
+    robot_description_file = LaunchConfiguration('robot_description_file')
+    allow_execution = LaunchConfiguration('allow_execution')
     can_id = LaunchConfiguration("arm_can_id")
     status_topic = LaunchConfiguration("arm_pub_topic_name")
     cmd_topic = LaunchConfiguration("arm_sub_topic_name")
@@ -41,6 +44,10 @@ def generate_launch_description():
         .planning_pipelines(pipelines=["ompl"])
         .to_moveit_configs()
     )
+    # All consumers must use the same model (especially a calibrated candidate).
+    moveit_config.robot_description = {
+        'robot_description': ParameterValue(Command(['xacro ', robot_description_file]), value_type=str)
+    }
 
     # Prefer description without depending on mock controllers running.
     # robot_description still may include ros2_control block; unused without controller_manager.
@@ -76,6 +83,12 @@ def generate_launch_description():
         parameters=[adapter_config],
         condition=IfCondition(start_adapter),
     )
+    readonly_feedback = Node(
+        package='x5a_handeye', executable='readonly_joint_states',
+        name='x5a_readonly_joint_states', output='screen',
+        parameters=[{'status_topic': status_topic}],
+        condition=IfCondition(start_readonly_feedback),
+    )
 
     rsp = Node(
         package="robot_state_publisher",
@@ -103,7 +116,7 @@ def generate_launch_description():
                 # this capability; controller selection remains in MoveIt.
                 "capabilities": "move_group/ExecuteTaskSolutionCapability",
                 "publish_robot_description_semantic": True,
-                "allow_trajectory_execution": True,
+                "allow_trajectory_execution": ParameterValue(allow_execution, value_type=bool),
                 "publish_planning_scene": True,
                 "publish_geometry_updates": True,
                 "publish_state_updates": True,
@@ -134,6 +147,13 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("use_rviz", default_value="true"),
+            DeclareLaunchArgument('robot_description_file',
+                                  default_value=str(moveit_config.package_path / 'config' / 'X5A.urdf.xacro'),
+                                  description='Shared URDF/xacro for MoveIt, RViz and robot_state_publisher'),
+            DeclareLaunchArgument('allow_execution', default_value='true',
+                                  description='Set false for planning-only model validation; also disable driver/adapter startup'),
+            DeclareLaunchArgument('start_readonly_feedback', default_value='false',
+                                  description='Display raw RobotStatus joints without any command/action interface'),
             DeclareLaunchArgument(
                 "start_driver",
                 default_value="true",
@@ -151,6 +171,7 @@ def generate_launch_description():
             static_tf,
             rsp,
             arx_driver,
+            readonly_feedback,
             TimerAction(period=1.0, actions=[official_adapter]),
             TimerAction(period=3.0, actions=[move_group]),
             TimerAction(period=5.0, actions=[rviz]),

@@ -1,0 +1,139 @@
+/**:
+  ros__parameters:
+    color_topic: /wrist_camera/color/image_raw
+    color_reliability: reliable
+    aligned_depth_topic: /wrist_camera/depth/image_raw
+    camera_info_topic: /wrist_camera/color/camera_info
+    optical_frame: wrist_camera_color_optical_frame
+    base_frame: base_link
+    colors:
+      red:
+        hsv_lower:
+        - 0
+        - 80
+        - 55
+        hsv_upper:
+        - 2
+        - 255
+        - 255
+        use_second_hsv: true
+        hsv_lower_2:
+        - 170
+        - 80
+        - 55
+        hsv_upper_2:
+        - 179
+        - 255
+        - 255
+      white:
+        hsv_lower:
+        - 0
+        - 0
+        - 145
+        hsv_upper:
+        - 179
+        - 110
+        - 255
+        use_second_hsv: false
+        hsv_lower_2:
+        - 0
+        - 0
+        - 0
+        hsv_upper_2:
+        - 0
+        - 0
+        - 0
+      orange:
+        hsv_lower:
+        - 3
+        - 150
+        - 70
+        hsv_upper:
+        - 28
+        - 255
+        - 255
+        use_second_hsv: false
+        hsv_lower_2:
+        - 0
+        - 0
+        - 0
+        hsv_upper_2:
+        - 0
+        - 0
+        - 0
+    detection:
+      min_area_px: 911.25017123661
+      max_area_px: 25312.5047565725
+      min_rectangularity: 0.5
+      max_aspect_ratio: 3.0
+      open_iterations: 1
+      close_iterations: 2
+      inner_erode_px: 11
+      top_face_mode: base_plane
+      max_cube_layers: 2
+      face_size_tolerance_m: 0.012
+      max_rgbd_gap_s: 0.04
+    depth:
+      scale_16uc1: 0.001
+      min_m: 0.2
+      max_m: 0.8
+      near_percentile: 55.0
+    object:
+      size_x: 0.03
+      size_y: 0.03
+      size_z: 0.03
+    table:
+      z: -0.006
+      top_tolerance: 0.015
+    workspace:
+      allow_mirrored_side: true
+      x_min: -0.08
+      x_max: 0.48
+      y_min: 0.02
+      y_max: 0.58
+      r_max: 0.65
+      z_min: -0.015
+      z_max: 0.08
+      expected_x: 0.2
+      expected_y: 0.33
+    filter:
+      window: 5
+      miss_grace_s: 2.0
+      max_std_x: 0.005
+      max_std_y: 0.005
+      max_std_z: 0.008
+      reset_distance_m: 0.03
+    box:
+      gray_rim_enabled: true
+      gray_rim_max_s: 130
+      gray_rim_max_v: 200
+      hsv_lower:
+      - 0
+      - 0
+      - 0
+      hsv_upper:
+      - 179
+      - 255
+      - 85
+      min_area_px: 40500.007610516
+      max_area_px: 405000.07610516
+      min_aspect_ratio: 1.1
+      max_aspect_ratio: 2.8
+      min_rectangularity: 0.7
+      border_margin_px: 5
+      open_iterations: 1
+      close_iterations: 2
+      filter_window: 3
+      max_std_xy: 0.012
+      reset_distance_m: 0.03
+      miss_grace_s: 3.0
+      min_supported_sides: 3
+      size_tolerance_m: 0.03
+      edge_support_fraction: 0.1
+      rim_height_m: 0.06
+      rim_tolerance_m: 0.008
+      adaptive_height_range_m: 0.02
+      plane_tolerance_m: 0.004
+      max_rim_tilt_deg: 10.0
+      inner_size_x: 0.14
+      inner_size_y: 0.09

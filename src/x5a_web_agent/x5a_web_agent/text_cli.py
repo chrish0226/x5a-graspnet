@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from x5a_web_agent.terminal import TerminalBackend, TerminalConsole
 
-_URL_DEFAULT = "http://127.0.0.1:8000"
+_URL_DEFAULT = "http://127.0.0.1:8001"
 POLL_INTERVAL = 1.0
 
 

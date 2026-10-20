@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only manual eye-to-hand sample collector for the ARX X5A.
+"""Read-only manual eye-in-hand or eye-to-hand collector for the ARX X5A.
 
 This node deliberately has no RobotCmd import, no action/service client and no
 application publisher.  It only subscribes to the official robot feedback and
@@ -27,12 +27,14 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
 from arx5_arm_msg.msg import RobotStatus
 from x5a_handeye.transforms import T_to_pose
 from x5a_handeye.x5a_fk import fk_base_tool0
+from x5a_handeye.observations import observation_geometry, pair_observations
 
 
 def rpy_to_quat(roll: float, pitch: float, yaw: float) -> List[float]:
@@ -106,7 +108,9 @@ def rotation_std_deg(poses: Sequence[Dict[str, List[float]]]) -> float:
     for pose in poses:
         dot = abs(float(np.dot(mean, pose["quat_xyzw"])))
         angles.append(math.degrees(2.0 * math.acos(max(-1.0, min(1.0, dot)))))
-    return float(np.std(angles))
+    # RMS deviation from the mean: std(angle) would report zero for poses
+    # oscillating symmetrically at the same angular distance from the mean.
+    return float(np.sqrt(np.mean(np.square(angles))))
 
 
 class ReadOnlyHandeyeSampler(Node):
@@ -114,13 +118,12 @@ class ReadOnlyHandeyeSampler(Node):
         super().__init__("x5a_readonly_handeye_sampler")
         self.declare_parameter("status_topic", "/arm_status")
         self.declare_parameter("board_pose_topic", "/calibration_board/pose")
-        self.declare_parameter(
-            "sample_json",
-            str(
-                Path.home()
-                / "arx/x5a_ws/src/x5a_handeye/data/manual_samples_readonly.json"
-            ),
-        )
+        self.declare_parameter('calibration_type', 'eye_to_hand')
+        self.declare_parameter('sample_json', '')
+        self.declare_parameter('max_board_age_s', 0.5)
+        self.declare_parameter('board_observation_topic', '')
+        self.declare_parameter('require_board_observation', False)
+        self.declare_parameter('max_pair_stamp_delta_s', 0.04)
         self.declare_parameter("capture_s", 0.8)
         self.declare_parameter("min_robot_messages", 10)
         self.declare_parameter("min_board_messages", 5)
@@ -132,7 +135,22 @@ class ReadOnlyHandeyeSampler(Node):
 
         self.status_topic = str(self.get_parameter("status_topic").value)
         self.board_topic = str(self.get_parameter("board_pose_topic").value)
-        self.sample_json = Path(str(self.get_parameter("sample_json").value))
+        self.calibration_type = str(self.get_parameter('calibration_type').value)
+        if self.calibration_type not in ('eye_to_hand', 'eye_in_hand'):
+            raise ValueError('calibration_type must be eye_to_hand or eye_in_hand')
+        filename = f'manual_samples_{self.calibration_type}.json'
+        self.sample_json = Path(str(self.get_parameter('sample_json').value)
+                                or str(Path.home() / '.ros/x5a_handeye' / filename))
+        self.max_board_age = float(self.get_parameter('max_board_age_s').value)
+        self.last_board_stamp = None
+        self.last_robot_stamp = None
+        self.observation_topic = str(self.get_parameter('board_observation_topic').value)
+        self.require_observation = bool(self.get_parameter('require_board_observation').value)
+        self.max_pair_delta = float(self.get_parameter('max_pair_stamp_delta_s').value)
+        if self.require_observation and not self.observation_topic:
+            raise ValueError('require_board_observation needs board_observation_topic')
+        self.observations = {}
+        self.geometry = None
         self.capture_s = float(self.get_parameter("capture_s").value)
         self.min_robot = int(self.get_parameter("min_robot_messages").value)
         self.min_board = int(self.get_parameter("min_board_messages").value)
@@ -154,13 +172,15 @@ class ReadOnlyHandeyeSampler(Node):
         self.samples: List[Dict] = []
 
         if bool(self.get_parameter("append_existing").value) and self.sample_json.exists():
-            try:
-                payload = json.loads(self.sample_json.read_text())
-                existing = payload.get("samples", [])
-                if isinstance(existing, list):
-                    self.samples = existing
-            except Exception as exc:
-                self.get_logger().warn(f"could not load existing samples: {exc}")
+            payload = json.loads(self.sample_json.read_text())
+            if payload.get('calibration_type', 'eye_to_hand') != self.calibration_type:
+                raise ValueError('existing samples use a different calibration mode; use a new file')
+            self.samples = payload['samples']
+            if not isinstance(self.samples, list):
+                raise ValueError('existing samples must be a list')
+            self.geometry = payload.get('observation_geometry')
+            if self.require_observation and self.samples and self.geometry is None:
+                raise ValueError('existing samples lack board/camera geometry; use a new sample file')
 
         # These are the only application subscriptions.  There is intentionally
         # no publisher/client that can reach /arm_cmd, /arx_joy or an action.
@@ -170,6 +190,8 @@ class ReadOnlyHandeyeSampler(Node):
         self.create_subscription(
             PoseStamped, self.board_topic, self.on_board, qos_profile_sensor_data
         )
+        if self.observation_topic:
+            self.create_subscription(String, self.observation_topic, self.on_observation, 10)
 
         self.get_logger().info(
             "READ-ONLY sampler: subscriptions=%s,%s; arm command publishers=NONE"
@@ -180,6 +202,11 @@ class ReadOnlyHandeyeSampler(Node):
         )
 
     def on_status(self, msg: RobotStatus) -> None:
+        stamp_ns = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
+        age_s = (self.get_clock().now().nanoseconds - stamp_ns) * 1e-9
+        if (stamp_ns <= 0 or stamp_ns == self.last_robot_stamp
+                or age_s < -0.1 or age_s > self.max_board_age):
+            return
         if len(msg.joint_pos) < 6:
             self.get_logger().warn("/arm_status has fewer than six joints")
             return
@@ -189,28 +216,50 @@ class ReadOnlyHandeyeSampler(Node):
         except ValueError as exc:
             self.get_logger().warn(str(exc))
             return
+        self.last_robot_stamp = stamp_ns
         if len(msg.joint_pos) >= 7:
             self.latest_gripper = float(msg.joint_pos[6])
         if self.capturing:
             self.robot_records.append(
                 {
                     "pose": pose,
+                    'stamp_ns': stamp_ns,
                     "joints": list(self.latest_q) if self.latest_q is not None else None,
                     "gripper": self.latest_gripper,
                 }
             )
 
     def on_board(self, msg: PoseStamped) -> None:
+        stamp_ns = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
+        age_s = (self.get_clock().now().nanoseconds - stamp_ns) * 1e-9
+        if (not msg.header.frame_id or stamp_ns <= 0 or stamp_ns == self.last_board_stamp
+                or age_s < -0.1 or age_s > self.max_board_age):
+            return
         try:
             pose = board_pose(msg)
         except ValueError as exc:
             self.get_logger().warn(str(exc))
             return
         self.have_board = True
+        self.last_board_stamp = stamp_ns
         if self.capturing:
             self.board_records.append(
-                {"pose": pose, "frame_id": str(msg.header.frame_id)}
+                {"pose": pose, "frame_id": str(msg.header.frame_id), 'stamp_ns': stamp_ns}
             )
+
+    def on_observation(self, msg: String) -> None:
+        try:
+            observation = json.loads(msg.data)
+            observation_geometry(observation)
+            stamp = int(observation['stamp_ns'])
+            age_s = (self.get_clock().now().nanoseconds - stamp)*1e-9
+            if age_s < -0.1 or age_s > self.max_board_age:
+                return
+            self.observations[stamp] = observation
+            while len(self.observations) > 256:
+                self.observations.pop(next(iter(self.observations)))
+        except (ValueError, KeyError, TypeError) as exc:
+            self.get_logger().warn(f'invalid board observation: {exc}', throttle_duration_sec=5.0)
 
     def ready(self) -> bool:
         if self.latest_q is None:
@@ -272,6 +321,28 @@ class ReadOnlyHandeyeSampler(Node):
             else None
         )
         frame_ids = [r["frame_id"] for r in self.board_records if r["frame_id"]]
+        existing_frames = {s.get('source', {}).get('board_frame_id') for s in self.samples}
+        existing_frames.discard(None)
+        existing_frames.discard('')
+        if len(set(frame_ids) | existing_frames) != 1:
+            self.get_logger().error('rejected: camera optical frame changed; use a new sample file')
+            return
+        pairs = pair_observations(self.board_records, self.robot_records, self.observations,
+                                  self.max_pair_delta) if self.observation_topic else []
+        if self.require_observation and len(pairs) < self.min_board:
+            self.get_logger().error('rejected: too few time-matched board observations; restart the updated detector')
+            return
+        if pairs:
+            geometry = observation_geometry(pairs[0]['vision'])
+            if (any(observation_geometry(p['vision']) != geometry for p in pairs)
+                    or (self.geometry is not None and self.geometry != geometry)):
+                self.get_logger().error('rejected: board/camera geometry changed; use a new sample file')
+                return
+            self.geometry = geometry
+            # Use robot feedback matched to image time for the averaged poses.
+            robot_poses = [p['T_base_tool'] for p in pairs]
+            board_poses = [p['T_camera_board'] for p in pairs]
+            q = np.mean([p['joints'] for p in pairs], axis=0).tolist()
         sample = {
             "index": len(self.samples),
             "stamp": time.time(),
@@ -288,6 +359,10 @@ class ReadOnlyHandeyeSampler(Node):
                 "board_rotation_std_deg": board_r,
                 "n_robot": nr,
                 "n_board": nb,
+                'n_time_matched': len(pairs),
+                'max_pair_delta_s': max((p['pair_delta_s'] for p in pairs), default=None),
+                'reprojection_rms_px_mean': (float(np.mean([
+                    p['vision']['quality']['reprojection_rms_px'] for p in pairs])) if pairs else None),
             },
             "source": {
                 "robot": f"{self.status_topic}.joint_pos -> URDF FK base_link->tool0",
@@ -296,15 +371,19 @@ class ReadOnlyHandeyeSampler(Node):
                 "control_commands_sent": False,
             },
         }
+        if pairs:
+            sample['observations'] = pairs
         self.samples.append(sample)
         self.sample_json.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "calibration_type": "eye_to_hand",
+            "calibration_type": self.calibration_type,
+            "camera_frame": frame_ids[-1],
             "collection": "manual_gravity_readonly_urdf_fk",
             "base_frame": "base_link",
             "tool_frame": "tool0",
             "robot_pose_frame": "tool0",
             "control_commands_sent": False,
+            'observation_geometry': self.geometry,
             "samples": self.samples,
         }
         self.sample_json.write_text(json.dumps(payload, indent=2))

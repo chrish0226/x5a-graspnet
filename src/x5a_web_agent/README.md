@@ -1,5 +1,7 @@
 # X5A 手机语音抓取 Demo
 
+> 腕部工作区的当前入口与两套模式见[主 README](../../README.md)、[纯颜色流程](../../docs/COLOR_WORKFLOW.md)和[SAM 流程](../../docs/SAM_WRIST.md)。下文保留原固定相机/数字人联动接口说明；当前腕部启动脚本默认关闭 MQTT 与文字转发。
+
 手机当麦克风，Ubuntu 主机跑 Web + ROS 2 Task Server，复用已经验证过的 `x5a_pick_place`。
 
 ```text
@@ -40,7 +42,7 @@ colcon build --symlink-install \
 source install/setup.bash
 ```
 
-完整启动、测试和排错见仓库根目录 [docs/VOICE_INTERACTION.md](../../docs/VOICE_INTERACTION.md)。
+腕部启动、测试和排错见仓库根目录 [README.md](../../README.md)。
 
 ## 把识别原文发到远程服务器
 

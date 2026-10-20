@@ -14,6 +14,7 @@ def generate_launch_description():
     config = os.path.join(share, "config", "remote_grasp.yaml")
     return LaunchDescription(
         [
+            DeclareLaunchArgument('config_file', default_value=config),
             DeclareLaunchArgument("base_url", default_value="http://118.253.179.80:8300"),
             DeclareLaunchArgument("planning_enabled", default_value="true"),
             DeclareLaunchArgument("start_ik_server", default_value="true"),
@@ -37,7 +38,7 @@ def generate_launch_description():
                 name="x5a_remote_grasp",
                 output="screen",
                 parameters=[
-                    config,
+                    LaunchConfiguration('config_file'),
                     {
                         "remote.base_url": LaunchConfiguration("base_url"),
                         "planning.enabled": ParameterValue(

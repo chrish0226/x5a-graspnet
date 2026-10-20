@@ -79,11 +79,19 @@ class PlanOnlyMoveIt:
         parallel_ik_service: str = "",
         parallel_ik_workers: int = 4,
         parallel_ik_fallback_serial: bool = True,
+        stage_scaling: Optional[dict] = None,
+        pipeline_id: str = "ompl",
+        planner_id: str = "RRTConnect",
     ) -> None:
         self.node = node
         self.deadline = None
         self.last_solution_seed: Optional[List[float]] = None
+        self.sequence_cache_enabled = False
+        self.grasp_branch_recovery_enabled = False
+        self.reset_sequence_cache()
         self.group_name = group_name
+        self.pipeline_id = str(pipeline_id)
+        self.planner_id = str(planner_id)
         self.tcp_frame = tcp_frame
         self.allowed_time = float(allowed_time)
         self.result_timeout = float(result_timeout)
@@ -91,6 +99,13 @@ class PlanOnlyMoveIt:
         self.attempts = int(attempts)
         self.velocity_scaling = float(velocity_scaling)
         self.acceleration_scaling = float(acceleration_scaling)
+        self.stage_scaling = dict(self.STAGE_SCALING)
+        if stage_scaling is not None:
+            for stage, values in stage_scaling.items():
+                pair = tuple(float(v) for v in values)
+                if len(pair) != 2 or not all(np.isfinite(v) and 0.0 < v <= 1.0 for v in pair):
+                    raise ValueError('stage speed/acceleration must be in (0, 1]')
+                self.stage_scaling[stage.upper()] = pair
         self.position_tolerance = float(position_tolerance)
         self.orientation_tolerance = float(orientation_tolerance)
         self.cartesian_step = float(cartesian_step)
@@ -155,15 +170,20 @@ class PlanOnlyMoveIt:
             return False, "MoveIt /compute_cartesian_path is unavailable"
         return True, ""
 
-    def apply_scene(self, scene: PlanningScene) -> Tuple[bool, str]:
+    def apply_scene(self, scene: PlanningScene, collision_pairs=None) -> Tuple[bool, str]:
+        self.reset_sequence_cache()
         # MoveIt reports failure when REMOVE names an object already absent.
         # Query first so cleanup remains safe across tasks and node restarts.
         from moveit_msgs.msg import CollisionObject, PlanningSceneComponents
-        if any(o.operation == CollisionObject.REMOVE for o in scene.world.collision_objects):
+        if (collision_pairs or any(o.operation == CollisionObject.REMOVE for o in scene.world.collision_objects)
+                or any(a.object.operation == CollisionObject.REMOVE
+                       for a in scene.robot_state.attached_collision_objects)):
             if not self.scene_query_client.wait_for_service(timeout_sec=self._timeout(1.0)):
                 return False, 'planning scene query unavailable during obstacle cleanup'
             query = GetPlanningScene.Request()
-            query.components.components = PlanningSceneComponents.WORLD_OBJECT_NAMES
+            query.components.components = (PlanningSceneComponents.WORLD_OBJECT_NAMES
+                                           | PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+                                           | PlanningSceneComponents.ALLOWED_COLLISION_MATRIX)
             future = self.scene_query_client.call_async(query)
             if not self._wait(future, 2.0) or future.result() is None:
                 return False, 'planning scene query failed during obstacle cleanup'
@@ -171,6 +191,14 @@ class PlanOnlyMoveIt:
             scene = copy.deepcopy(scene)
             scene.world.collision_objects = [o for o in scene.world.collision_objects
                                              if o.operation != CollisionObject.REMOVE or o.id in present]
+            present_attached = {a.object.id for a in future.result().scene.robot_state.attached_collision_objects}
+            scene.robot_state.attached_collision_objects = [
+                a for a in scene.robot_state.attached_collision_objects
+                if a.object.operation != CollisionObject.REMOVE or a.object.id in present_attached]
+            if collision_pairs:
+                from x5a_remote_grasp.scene_policy import merge_collision_pairs
+                scene.allowed_collision_matrix = merge_collision_pairs(
+                    future.result().scene.allowed_collision_matrix, collision_pairs)
         request = ApplyPlanningScene.Request()
         request.scene = scene
         future = self.scene_client.call_async(request)
@@ -203,6 +231,21 @@ class PlanOnlyMoveIt:
             if len(joints) >= 6:
                 attempts.append(self.joints_to_state(joints))
         attempts.append(None)
+        # Every seed must preserve the planned jaw opening, including serial
+        # fallback. Otherwise PREGRASP can be solved with the live closed jaws
+        # even though execution opens them before moving.
+        if seed is not None:
+            planned = dict(zip(seed.joint_state.name, seed.joint_state.position))
+            fingers = {name: planned[name] for name in ('joint7', 'joint8') if name in planned}
+            if fingers:
+                adjusted = []
+                for attempt in attempts:
+                    state = copy.deepcopy(attempt) if attempt is not None else RobotState(is_diff=True)
+                    values = dict(zip(state.joint_state.name, state.joint_state.position))
+                    values.update(fingers)
+                    state.joint_state.name, state.joint_state.position = list(values), list(values.values())
+                    adjusted.append(state)
+                attempts = adjusted
         last_reason = "collision-aware IK failed"
         seen = set()
         unique = []
@@ -321,19 +364,110 @@ class PlanOnlyMoveIt:
         "RETREAT": (0.35, 0.20),
     }
 
+    def reset_sequence_cache(self):
+        """Only reuse work inside one immutable planning request/scene."""
+        self._sequence_cache = {}
+        self.sequence_cache_stats = dict(hits=0, negative_hits=0, stage_calls=0,
+                                        approach_recoveries=0)
+
+    @staticmethod
+    def _pose_key(pose):
+        p, q = pose.pose.position, pose.pose.orientation
+        return (pose.header.frame_id, pose.header.stamp.sec, pose.header.stamp.nanosec,
+                p.x, p.y, p.z, q.x, q.y, q.z, q.w)
+
+    @staticmethod
+    def reverse_trajectory(trajectory):
+        result = copy.deepcopy(trajectory)
+        original = trajectory.joint_trajectory.points
+        if not original:
+            raise ValueError('cannot reverse an empty trajectory')
+        times = [p.time_from_start.sec*1_000_000_000+p.time_from_start.nanosec for p in original]
+        if any(b <= a for a, b in zip(times, times[1:])):
+            raise ValueError('trajectory times must increase')
+        result.joint_trajectory.points = list(reversed(result.joint_trajectory.points))
+        for point, stamp in zip(result.joint_trajectory.points, reversed(times)):
+            elapsed = times[-1]-stamp
+            point.time_from_start.sec, point.time_from_start.nanosec = divmod(elapsed, 1_000_000_000)
+            point.velocities = [-value for value in point.velocities]
+        return result
+
+    def _recover_approach(self, pregrasp, grasp, initial_state, previous_state):
+        """Solve contact IK, propagate a straight approach backwards, then
+        connect the current robot state to that compatible pregrasp branch.
+        """
+        if self._timeout(1.0) <= 0:
+            return None
+        contact, reason = self.collision_aware_ik(grasp, previous_state,
+            extra_joint_seeds=getattr(self, 'default_joint_seeds', None))
+        if contact is None:
+            return None
+        velocity, acceleration = getattr(self, 'stage_scaling', self.STAGE_SCALING)['GRASP']
+        backwards, reason = self.plan_cartesian(pregrasp, contact, velocity, acceleration)
+        if backwards is None or not self.verify_endpoint(backwards, contact, pregrasp)[0]:
+            return None
+        compatible = self.end_state(contact, backwards)
+        velocity, acceleration = getattr(self, 'stage_scaling', self.STAGE_SCALING)['PREGRASP']
+        connection, reason = self.plan_joints(compatible, initial_state, velocity, acceleration)
+        if connection is None:
+            return None
+        approach = self.reverse_trajectory(backwards)
+        if (not self.verify_endpoint(connection.planned_trajectory, connection.trajectory_start, pregrasp)[0]
+                or not self.verify_endpoint(approach, compatible, grasp)[0]):
+            return None
+        # No discontinuity may be hidden between the new global connection
+        # and the reversed approach, even if both individual FK checks pass.
+        end = connection.planned_trajectory.joint_trajectory.points[-1].positions
+        first = approach.joint_trajectory.points[0].positions
+        if (connection.planned_trajectory.joint_trajectory.joint_names != approach.joint_trajectory.joint_names
+                or len(end) != len(first) or max(abs(a-b) for a, b in zip(end, first)) > 1e-4):
+            return None
+        return connection.planned_trajectory, connection.trajectory_start, approach, compatible
+
     def plan_sequence(
         self, poses: Sequence[Tuple[str, PoseStamped]]
     ) -> Tuple[Optional[SequencePlan], str]:
         start_state: Optional[RobotState] = None
+        opening = getattr(self, 'expected_pregrasp_open_position', None)
+        if opening is not None:
+            start_state = RobotState(is_diff=True)
+            start_state.joint_state.name = ['joint7', 'joint8']
+            start_state.joint_state.position = [float(opening), float(opening)]
         trajectory_start: Optional[RobotState] = None
         trajectories: List[RobotTrajectory] = []
         stages: List[str] = []
+        cache = self._sequence_cache if getattr(self, 'sequence_cache_enabled', False) else None
+        stats = getattr(self, 'sequence_cache_stats', {})
+        context = tuple(getattr(self, name, None) for name in (
+            'expected_pregrasp_open_position', 'expected_grasp_finger_position', 'expected_place_open_position',
+            'pipeline_id', 'planner_id'))
+        seeds = tuple(tuple(float(v) for v in seed) for seed in getattr(self, 'default_joint_seeds', []) or [])
+        keys = [(context, seeds)]
         for stage, pose in poses:
             if self._timeout(1.0) <= 0:
                 return None, f'{stage}: planning budget exhausted'
-            velocity, acceleration = self.STAGE_SCALING.get(
+            velocity, acceleration = getattr(self, 'stage_scaling', self.STAGE_SCALING).get(
                 stage.upper(), (self.velocity_scaling, self.acceleration_scaling)
             )
+            if cache is not None:
+                clearance = getattr(self, 'retreat_clearance_pose', None) if stage.upper() == 'RETREAT' else None
+                keys.append((stage, self._pose_key(pose), velocity, acceleration,
+                             None if clearance is None else self._pose_key(clearance)))
+                key = tuple(keys)
+                cached = cache.get(key)
+                if cached is not None:
+                    stats['hits'] += 1
+                    if isinstance(cached, str):
+                        stats['negative_hits'] += 1
+                        return None, cached
+                    trajectory, used_start, start_state = copy.deepcopy(cached)
+                    if trajectory_start is None:
+                        trajectory_start = copy.deepcopy(used_start)
+                    trajectories.append(trajectory)
+                    stages.append(stage)
+                    self.last_solution_seed = self._arm_joints(start_state)
+                    continue
+            stats['stage_calls'] = stats.get('stage_calls', 0)+1
             trajectory, used_start, reason = self._plan_stage(
                 stage,
                 pose,
@@ -341,7 +475,18 @@ class PlanOnlyMoveIt:
                 velocity,
                 acceleration,
             )
+            if (trajectory is None and stage.upper() == 'GRASP' and stages == ['PREGRASP']
+                    and getattr(self, 'grasp_branch_recovery_enabled', False)):
+                recovered = self._recover_approach(poses[0][1], pose, trajectory_start, start_state)
+                if recovered is not None:
+                    connection, initial, trajectory, used_start = recovered
+                    trajectories[0], trajectory_start = connection, copy.deepcopy(initial)
+                    stats['approach_recoveries'] = stats.get('approach_recoveries', 0)+1
+                    if cache is not None:
+                        cache[tuple(keys[:-1])] = copy.deepcopy((connection, initial, used_start))
             if trajectory is None or used_start is None:
+                if cache is not None and len(cache) < 1024 and not any(word in reason.lower() for word in ('timeout', 'timed out', 'budget')):
+                    cache[key] = f'{stage}: {reason}'
                 return None, f"{stage}: {reason}"
             verified, reason = self.verify_endpoint(trajectory, used_start, pose)
             if not verified:
@@ -369,6 +514,8 @@ class PlanOnlyMoveIt:
                 start_state.joint_state.name = names
                 start_state.joint_state.position = positions
             self.last_solution_seed = self._arm_joints(start_state)
+            if cache is not None and len(cache) < 1024:
+                cache[key] = copy.deepcopy((trajectory, used_start, start_state))
         assert trajectory_start is not None
         return SequencePlan(stages, trajectories, trajectory_start), ""
 
@@ -393,7 +540,7 @@ class PlanOnlyMoveIt:
                 f"{stage} cartesian failed ({reason}); rejecting incomplete approach"
             )
             return None, None, f'{stage}: complete straight approach required: {reason}'
-        extra = None if start_state is not None else getattr(
+        extra = None if start_state is not None and name != 'PREGRASP' else getattr(
             self, "default_joint_seeds", None
         )
         ik_state, ik_reason = self.collision_aware_ik(
@@ -550,9 +697,13 @@ class PlanOnlyMoveIt:
         joints = self._arm_joints(goal_state)
         if joints is None:
             return None, "IK solution is missing joint1..joint6"
+        if not self.move_client.wait_for_server(timeout_sec=self._timeout(3.0)):
+            return None, "MoveGroup action server is unavailable; check planning.move_group_action"
         goal = MoveGroup.Goal()
         request = MotionPlanRequest()
         request.group_name = self.group_name
+        request.pipeline_id = getattr(self, 'pipeline_id', 'ompl')
+        request.planner_id = getattr(self, 'planner_id', 'RRTConnect')
         request.num_planning_attempts = max(1, self.attempts)
         request.allowed_planning_time = max(0.01, self._timeout(self.allowed_time))
         request.max_velocity_scaling_factor = min(1.0, max(0.001, velocity_scaling))
@@ -609,6 +760,8 @@ class PlanOnlyMoveIt:
         goal = MoveGroup.Goal()
         request = MotionPlanRequest()
         request.group_name = self.group_name
+        request.pipeline_id = getattr(self, 'pipeline_id', 'ompl')
+        request.planner_id = getattr(self, 'planner_id', 'RRTConnect')
         request.num_planning_attempts = max(1, self.attempts)
         request.allowed_planning_time = max(0.01, self._timeout(self.allowed_time))
         velocity = self.velocity_scaling if velocity_scaling is None else velocity_scaling

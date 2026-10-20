@@ -1,72 +1,58 @@
-# ROS 2
-build/
-install/
-log/
-logs/
-
-# Python
+/build/
+/install/
+/log/
+/logs/
+/reports/
+/backups/
+/.deps/
+/vendor/
+/src/x5a_handeye/data/
+/docs/*.json
+/docs/*.jpg
+/docs/*.png
+/docs/sdk_offline_latch_probe_*.py
+/models/*
+!/models/README.md
+!/models/x5a_stock_gripper.json
+!/models/x5a_stock_collision_link*.stl
 __pycache__/
-*.pyc
-*.pyo
-*.egg-info/
+*.py[cod]
 .pytest_cache/
-
-# C/C++
-*.o
-*.so
-
-# IDE
-.vscode/
-.idea/
-
-# Temporary and runtime output
-*.tmp
-*.swp
-*~
-*.log
-*.pid
-
-# Local credentials and private keys
+.ruff_cache/
+.venv/
+venv/
+certs/
 .env
 .env.*
 !.env.example
+*.env
 !*.env.example
-*.key
 *.pem
+*.key
 *.p12
 *.pfx
-
-# Downloaded model checkpoints
+*.keystore
+*.jks
+*.pid
+*.log
+*.bag
+*.db3
+*.mcap
+*.onnx
 *.pt
 *.pth
 *.ckpt
-*.onnx
-*.safetensors
-
-# ROS bags
-rosbag2_*/
-*.db3
-*.mcap
-
-# Core dumps
-core
-core.*
-
-# Generated TF/debug files
-*.gv
-frames.pdf
-
-# Local HTTPS certs for the phone web demo
-src/x5a_web_agent/certs/*.pem
-
-# Android build output
-android/**/.gradle/
-android/**/build/
-android/**/local.properties
-android/**/*.iml
-
-# Calibration runtime output (the verified input set is explicitly retained)
-src/x5a_handeye/data/*
-!src/x5a_handeye/data/manual_samples_readonly.json
-!src/x5a_handeye/data/manual_samples_recalib_20260812.json
-!src/x5a_handeye/data/manual_samples_recalib_20260813b.json
+*.tar
+*.tar.gz
+*.tar.bz2
+*.zip
+*.deb
+*.so
+*.so.*
+*.apk
+*.aab
+.gradle/
+**/build/
+**/local.properties
+.idea/
+.DS_Store

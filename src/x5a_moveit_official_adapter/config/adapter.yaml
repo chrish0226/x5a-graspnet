@@ -21,6 +21,9 @@
     # Tighter than the smallest commissioning move so a stationary arm can
     # never be reported as a successful execution.
     goal_tolerance_rad: 0.02
+    enforce_goal_tolerance: false
+    goal_advisory_tolerance_rad: 0.06
+    goal_advisory_settle_sec: 0.15
     goal_time_tolerance_sec: 2.0
     tracking_grace_sec: 0.75
     tracking_tolerance_rad: 0.40
@@ -32,6 +35,7 @@
     gripper_open_readout: 5.0
     gripper_finger_max_m: 0.044
     gripper_command_duration_sec: 0.8
+    gripper_open_ramp_sec: 0.65
     gripper_goal_tolerance_m: 0.004
     # OPEN targets above this value must actually reach the target within
     # tolerance, otherwise the goal is ABORTED. CLOSE targets stay lenient

@@ -341,8 +341,11 @@
       <origin
         xyz="0.041697 2.4368E-05 0.00014464"
         rpy="0 0 0" />
+      <!-- Gemini 345LG mounted on link6: add approximately 0.225 kg.
+           Mass-only approximation; COM and inertia retain the original values
+           until the camera mounting offset and inertia are measured. -->
       <mass
-        value="0.44089" />
+        value="0.66589" />
       <inertia
         ixx="0.00038"
         ixy="0.00000"

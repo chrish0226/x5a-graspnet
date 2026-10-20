@@ -1,0 +1,44 @@
+/**:
+  ros__parameters:
+    official_status_topic: /arm_status
+    official_command_topic: /arm_cmd
+    action_name: /x5a_arm_controller/follow_joint_trajectory
+    gripper_action_name: /x5a_gripper_controller/gripper_cmd
+    joint_state_topic: /joint_states
+    position_mode: 5
+    # Real Linux host: 50 Hz command updates have enough margin for MoveIt
+    # trajectory tracking while the vendor controller retains the CAN loop.
+    command_rate_hz: 50.0
+    joint_state_rate_hz: 30.0
+    # Allow brief scheduler/USB-CAN jitter, while still stopping a genuinely
+    # disconnected trajectory within half a second.
+    status_timeout: 0.50
+    state_settle_sec: 2.0
+    max_status_jump_rad: 0.08
+    # Time-scaled continuity limit used after a delayed status frame.
+    max_status_speed_rad_s: 1.5
+    start_tolerance_rad: 0.15
+    # Tighter than the smallest commissioning move so a stationary arm can
+    # never be reported as a successful execution.
+    goal_tolerance_rad: 0.02
+    # Ordinary grasp accuracy: small final residuals are advisory after settling.
+    enforce_goal_tolerance: false
+    goal_advisory_tolerance_rad: 0.06
+    goal_advisory_settle_sec: 0.15
+    goal_time_tolerance_sec: 2.0
+    tracking_grace_sec: 0.75
+    tracking_tolerance_rad: 0.40
+    response_command_delta_rad: 0.03
+    response_actual_delta_rad: 0.002
+    response_timeout_sec: 1.5
+    max_joint_speed_rad_s: 1.0
+    gripper_closed_readout: 0.0
+    gripper_open_readout: 5.0
+    gripper_finger_max_m: 0.044
+    gripper_command_duration_sec: 0.8
+    gripper_open_ramp_sec: 0.65
+    gripper_goal_tolerance_m: 0.004
+    # OPEN targets above this value must actually reach the target within
+    # tolerance, otherwise the goal is ABORTED. CLOSE targets stay lenient
+    # because a real grasp stops the fingers before 0 m.
+    gripper_open_threshold_m: 0.03

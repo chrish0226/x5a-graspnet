@@ -5,7 +5,7 @@ from x5a_remote_grasp.geometry import rpy_rotation
 from x5a_remote_grasp.grasp_quality import (
     GripperGeometry, assess_tool_grasp, graspnet_tool_transform,
     height_statistics, held_from_gap, nms_indices, opening_measurement,
-    recenter_tool,
+    recenter_tool, depth_cloud, depth_points, voxel_cloud,
 )
 
 
@@ -13,6 +13,23 @@ def contact_cloud(x_span=(-0.01, 0.01), y_span=(-0.02, 0.02)):
     x, y, z = np.meshgrid(np.linspace(*x_span, 8),
                           np.linspace(*y_span, 15), np.linspace(-0.004, 0.004, 3))
     return np.column_stack([x.ravel(), y.ravel(), z.ravel()])
+
+
+def test_sparse_projection_is_identical_to_full_image_projection():
+    rng = np.random.default_rng(42)
+    depth = rng.uniform(.1, 1.5, (65, 93))
+    mask = rng.random(depth.shape) > .6
+    np.testing.assert_array_equal(depth_points(depth, mask, 893., 892., 46., 34.),
+        depth_cloud(depth, 893., 892., 46., 34.)[mask])
+
+
+@pytest.mark.parametrize('size', [.001, .003, .02])
+def test_fast_voxel_keys_preserve_exact_original_representatives_and_order(size):
+    rng = np.random.default_rng(43)
+    points = rng.normal(size=(8000, 3))*.05
+    points = np.vstack([points, points[:1000], points[:1000]+.00001])
+    _, indices = np.unique(np.floor(points/size).astype(np.int64), axis=0, return_index=True)
+    np.testing.assert_array_equal(voxel_cloud(points, size), points[np.sort(indices)])
 
 
 def test_nms_preserves_different_closing_axis_at_same_position():

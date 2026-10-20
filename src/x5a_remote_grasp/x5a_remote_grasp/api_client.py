@@ -50,6 +50,7 @@ class GraspAPIClient:
         api_key_env: str = "SAM_GRASPNET_API_KEY",
         connect_timeout: float = 3.0,
         inference_timeout: float = 120.0,
+        rgb_jpeg_quality: int = 0,
     ) -> None:
         parsed = urlsplit(str(base_url).rstrip("/"))
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -61,8 +62,25 @@ class GraspAPIClient:
         self.port = parsed.port or (443 if parsed.scheme == "https" else 80)
         self.base_path = parsed.path.rstrip("/")
         self.api_key_env = str(api_key_env)
+        self.rgb_jpeg_quality = int(rgb_jpeg_quality)
+        if self.rgb_jpeg_quality and not 80 <= self.rgb_jpeg_quality <= 100:
+            raise ValueError('RGB JPEG quality must be 0 (PNG) or 80..100')
         self.connect_timeout = max(0.1, float(connect_timeout))
         self.inference_timeout = max(self.connect_timeout, float(inference_timeout))
+
+    def _rgb_upload(self, data):
+        if not self.rgb_jpeg_quality:
+            return ('color.png', 'image/png', data)
+        import cv2
+        import numpy as np
+        image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError('cannot decode RGB image for upload')
+        ok, encoded = cv2.imencode('.jpg', image,
+                                  [cv2.IMWRITE_JPEG_QUALITY, self.rgb_jpeg_quality])
+        if not ok:
+            raise ValueError('cannot encode RGB JPEG for upload')
+        return ('color.jpg', 'image/jpeg', encoded.tobytes())
 
     def api_key(self) -> str:
         key = str(os.environ.get(self.api_key_env, "") or "").strip()
@@ -88,14 +106,15 @@ class GraspAPIClient:
         rgb_png: bytes,
         depth_png: bytes,
         fields: Mapping[str, object],
+        mask_png: Optional[bytes] = None,
     ) -> Mapping[str, object]:
-        body, content_type = encode_multipart(
-            fields,
-            {
-                "rgb": ("color.png", "image/png", rgb_png),
-                "depth": ("depth.png", "image/png", depth_png),
-            },
-        )
+        files = {
+            "rgb": self._rgb_upload(rgb_png),
+            "depth": ("depth.png", "image/png", depth_png),
+        }
+        if mask_png is not None:
+            files["mask"] = ("target.png", "image/png", mask_png)
+        body, content_type = encode_multipart(fields, files)
         result = self._json_request(
             "POST",
             "/v1/grasp",
@@ -122,7 +141,7 @@ class GraspAPIClient:
         body, content_type = encode_multipart(
             fields,
             {
-                "rgb": ("color.png", "image/png", rgb_png),
+                "rgb": self._rgb_upload(rgb_png),
                 "depth": ("depth.png", "image/png", depth_png),
             },
         )

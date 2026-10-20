@@ -19,7 +19,8 @@ setup(
     license="BSD",
     entry_points={
         "console_scripts": [
-            "task_server_node = x5a_task_server.task_server_node:main",
+            "task_server_node = x5a_task_server.wrist_task_server:main",
+            "wrist_task_server = x5a_task_server.wrist_task_server:main",
         ]
     },
 )

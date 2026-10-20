@@ -14,6 +14,9 @@ def generate_launch_description():
     start_camera = LaunchConfiguration("start_camera")
     return LaunchDescription([
         DeclareLaunchArgument("start_camera", default_value="true"),
+        DeclareLaunchArgument("start_handeye_tf", default_value="true"),
+        DeclareLaunchArgument("handeye_result_yaml", default_value=result),
+        DeclareLaunchArgument("vision_config", default_value=config),
         Node(package="realsense2_camera", executable="realsense2_camera_node",
              namespace="camera", name="camera", output="screen",
              parameters=[{"serial_no": "_342522073696", "enable_color": True,
@@ -26,8 +29,9 @@ def generate_launch_description():
              condition=IfCondition(start_camera)),
         Node(package="x5a_handeye", executable="publish_handeye_tf",
              name="x5a_handeye_tf", output="screen",
-             parameters=[{"result_yaml": result}]),
+             parameters=[{"result_yaml": LaunchConfiguration("handeye_result_yaml")}],
+             condition=IfCondition(LaunchConfiguration("start_handeye_tf"))),
         TimerAction(period=2.0, actions=[Node(
             package="x5a_vision", executable="cube_detector", name="cube_detector",
-            output="screen", parameters=[config])]),
+            output="screen", parameters=[LaunchConfiguration("vision_config")])]),
     ])

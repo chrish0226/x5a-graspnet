@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>x5a_wrist_driver</name><version>0.1.0</version>
+  <description>Wrist-only ARX driver with feedback freshness and explicit protection recovery.</description>
+  <maintainer email="user@example.com">x5a user</maintainer><license>BSD-3-Clause</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend><depend>std_msgs</depend><depend>std_srvs</depend>
+  <depend>arx5_arm_msg</depend><depend>ament_index_cpp</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

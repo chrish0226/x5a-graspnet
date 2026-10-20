@@ -8,6 +8,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.view.MotionEvent;
+import android.view.View;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -23,7 +24,6 @@ import java.io.File;
 
 public class MainActivity extends AppCompatActivity {
     private static final int REQ_MIC = 17;
-    private static final String[] TERMINAL = {"SUCCESS", "FAILED", "IDLE", "DRY_RUN"};
 
     private final RobotClient client = new RobotClient();
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -37,6 +37,8 @@ public class MainActivity extends AppCompatActivity {
     private TextView parsedText;
     private TextView speechStatus;
     private TextView holdBtn;
+    private TextView observationSideText;
+    private boolean destroyed;
 
     private MediaRecorder recorder;
     private File recordFile;
@@ -45,19 +47,26 @@ public class MainActivity extends AppCompatActivity {
     private final Runnable pollTask = new Runnable() {
         @Override
         public void run() {
+            if (destroyed) return;
             client.pollState(new RobotClient.Callback() {
                 @Override
                 public void onOk(JSONObject json) {
+                    if (destroyed) return;
                     applyState(json);
+                    handler.postDelayed(pollTask, 800);
                 }
 
                 @Override
                 public void onError(String message) {
+                    if (destroyed) return;
                     linkBadge.setText("已断开");
+                    stageText.setText("连接中断");
+                    busyBadge.setText("离线");
+                    busyBadge.setTextColor(getColor(R.color.bad));
+                    showStatusDetail("请检查网络连接", true);
                     handler.postDelayed(pollTask, 1500);
                 }
             });
-            handler.postDelayed(this, 800);
         }
     };
 
@@ -74,10 +83,11 @@ public class MainActivity extends AppCompatActivity {
         parsedText = findViewById(R.id.parsedText);
         speechStatus = findViewById(R.id.speechStatus);
         holdBtn = findViewById(R.id.holdBtn);
+        observationSideText = findViewById(R.id.observationSideText);
 
-        findViewById(R.id.btnRed).setOnClickListener(v -> sendColor("red"));
-        findViewById(R.id.btnWhite).setOnClickListener(v -> sendColor("white"));
-        findViewById(R.id.btnOrange).setOnClickListener(v -> sendColor("orange"));
+        findViewById(R.id.btnPrepare).setOnClickListener(v -> sendCommand("当前侧准备"));
+        findViewById(R.id.btnPrepareMirror).setOnClickListener(v -> sendCommand("镜像侧准备"));
+        findViewById(R.id.btnHome).setOnClickListener(v -> sendCommand("回原点"));
         findViewById(R.id.btnStop).setOnClickListener(v -> client.cancel(toastCb("已请求停止")));
 
         holdBtn.setOnTouchListener((v, event) -> {
@@ -99,24 +109,28 @@ public class MainActivity extends AppCompatActivity {
 
     private void connect() {
         linkBadge.setText("连接中");
-        stageText.setText("正在连接 192.168.0.50");
+        stageText.setText("连接中");
+        showStatusDetail("", false);
         client.discover(new RobotClient.Callback() {
             @Override
             public void onOk(JSONObject json) {
+                if (destroyed) return;
                 String base = json.optString("base", client.baseUrl());
-                hostText.setText(base);
+                hostText.setText("App " + BuildConfig.VERSION_NAME + " · " + base);
                 linkBadge.setText("已连接");
-                stageText.setText(json.optBoolean("task_server", true) ? "空闲，等待指令" : "网页已连上，Task Server 未就绪");
+                stageText.setText(json.optBoolean("task_server", true) ? "待准备" : "服务未就绪");
                 handler.removeCallbacks(pollTask);
                 handler.post(pollTask);
             }
 
             @Override
             public void onError(String message) {
+                if (destroyed) return;
                 linkBadge.setText("未连接");
-                stageText.setText("连不上主机");
-                resultText.setText(message);
-                resultText.setTextColor(getColor(R.color.bad));
+                stageText.setText("连接异常");
+                busyBadge.setText("离线");
+                busyBadge.setTextColor(getColor(R.color.bad));
+                showStatusDetail("请检查网络连接", true);
                 handler.postDelayed(MainActivity.this::connect, 2000);
             }
         });
@@ -125,15 +139,16 @@ public class MainActivity extends AppCompatActivity {
     private void applyState(JSONObject state) {
         linkBadge.setText("已连接");
         String stage = state.optString("stage", "IDLE");
-        String stageZh = state.optString("stage_zh", stage);
-        if (!stageZh.isEmpty()) {
-            stageText.setText(stageZh);
-        }
-        boolean terminal = isTerminal(stage);
-        boolean busy = !terminal && (state.optBoolean("busy", false)
-                || "BUSY".equals(state.optString("robot_state")));
-        busyBadge.setText(busy ? "忙碌" : "空闲");
+        stageText.setText(StatusText.title(state));
+        boolean busy = StatusText.busy(state);
+        busyBadge.setText(busy ? "执行中" : "待命");
         busyBadge.setTextColor(getColor(busy ? R.color.accent : R.color.ok));
+        String armFault = state.optString("arm_fault", "");
+        observationSideText.setText("观察方向：" + state.optString("observation_label", "当前侧"));
+        if (!armFault.isEmpty()) {
+            busyBadge.setText("异常");
+            busyBadge.setTextColor(getColor(R.color.bad));
+        }
         String transcript = state.optString("transcript", "");
         if (!transcript.isEmpty() && !holding) {
             transcriptText.setText(transcript);
@@ -142,21 +157,13 @@ public class MainActivity extends AppCompatActivity {
         if (parsed != null) {
             parsedText.setText(parsed.toString());
         }
-        JSONObject last = state.optJSONObject("last_result");
-        if (last != null && last.has("message")) {
-            boolean ok = last.optBoolean("success", false);
-            resultText.setText(last.optString("message"));
-            resultText.setTextColor(getColor(ok ? R.color.ok : R.color.bad));
-        }
+        showStatusDetail(StatusText.detail(state), !armFault.isEmpty() || "FAILED".equals(stage));
     }
 
-    private boolean isTerminal(String stage) {
-        for (String item : TERMINAL) {
-            if (item.equals(stage)) {
-                return true;
-            }
-        }
-        return false;
+    private void showStatusDetail(String text, boolean error) {
+        resultText.setText(text);
+        resultText.setTextColor(getColor(error ? R.color.bad : R.color.muted));
+        resultText.setVisibility(text.isEmpty() ? View.GONE : View.VISIBLE);
     }
 
     private void startHold() {
@@ -246,9 +253,9 @@ public class MainActivity extends AppCompatActivity {
         speechStatus.setTextColor(getColor(R.color.muted));
     }
 
-    private void sendColor(String color) {
-        transcriptText.setText("手动：" + color);
-        client.sendColor(color, resultCb());
+    private void sendCommand(String command) {
+        transcriptText.setText("手动：" + command);
+        client.sendText(command, resultCb());
     }
 
     private RobotClient.Callback resultCb() {
@@ -259,17 +266,14 @@ public class MainActivity extends AppCompatActivity {
                     parsedText.setText(String.valueOf(json.opt("parsed")));
                 }
                 if (json.has("message")) {
-                    resultText.setText(json.optString("message"));
-                    resultText.setTextColor(getColor(
-                            json.optBoolean("ok", json.optBoolean("success", false))
-                                    ? R.color.ok : R.color.bad));
+                    boolean ok = json.optBoolean("ok", json.optBoolean("success", false));
+                    showStatusDetail(ok ? "指令已接收" : StatusText.failure(json.optString("message")), !ok);
                 }
             }
 
             @Override
             public void onError(String message) {
-                resultText.setText(message);
-                resultText.setTextColor(getColor(R.color.bad));
+                showStatusDetail(StatusText.failure(message), true);
             }
         };
     }
@@ -298,7 +302,8 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
-        handler.removeCallbacks(pollTask);
+        destroyed = true;
+        handler.removeCallbacksAndMessages(null);
         if (recorder != null) {
             try {
                 recorder.release();

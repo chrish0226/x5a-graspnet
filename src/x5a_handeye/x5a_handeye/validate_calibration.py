@@ -37,6 +37,8 @@ class Validator(Node):
     def __init__(self, result_yaml: str):
         super().__init__("x5a_handeye_validate")
         self.result = yaml.safe_load(Path(result_yaml).read_text())
+        if self.result.get('calibration_type') == 'eye_in_hand':
+            raise ValueError('this automatic validator is eye-to-hand only; use the read-only sampler and solver --holdout for eye-in-hand')
         self.T_base_cam = np.asarray(self.result["T_base_camera"], float)
         self.T_tool_board = np.asarray(self.result["T_tool_board"], float)
         self.q = None

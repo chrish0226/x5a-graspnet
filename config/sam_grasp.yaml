@@ -1,0 +1,232 @@
+# Gemini RGB-D + calibrated wrist model; independent of the fixed D435i setup.
+/**:
+  ros__parameters:
+    remote:
+      base_url: http://118.253.179.80:8300
+      api_key_env: SAM_GRASPNET_API_KEY
+      connect_timeout_s: 3.0
+      inference_timeout_s: 120.0
+      rgb_jpeg_quality: 95
+      threshold: 0.45
+      mask_dilation_px: 2
+      num_point: 20000
+      top_k_default: 20
+      top_k_max: 40
+      collision_thresh: 0.01
+      voxel_size: 0.005
+      target_distance_thresh: 0.006
+    topics:
+      color: /wrist_camera/color/image_raw
+      aligned_depth: /wrist_camera/depth/image_raw
+      camera_info: /wrist_camera/color/camera_info
+      image_reliability: reliable
+      display_path: /wrist_sam/display_planned_path
+    sync:
+      queue_size: 20
+      slop_s: 0.04
+      max_stamp_delta_s: 0.04
+      max_frame_age_s: 1.5
+    depth:
+      camera_node: /wrist_camera/wrist_camera
+      units_parameter: depth_module.depth_units
+      scale_m_per_unit_override: 0.001
+      allow_32fc1_reencode: false
+      min_m_default: 0.1
+      max_m_default: 1.5
+    frames:
+      base: wrist_preview/base_link
+      tf_timeout_s: 0.5
+      max_tf_stamp_delta_s: 0.1
+    workspace:
+      x_min: 0.08
+      x_max: 0.41
+      y_min: 0.08
+      y_max: 0.48
+      z_min: -0.005
+      z_max: 0.5
+      r_max: 0.54
+      table_clearance_m: 0.0  # Remove the former 5 mm TCP height margin.
+    gripper:
+      model_path: ""  # Restore the pre-unification gripper geometry.
+      max_width_m: 0.088
+      width_margin_m: 0.006
+      width_to_finger_ratio: 0.5
+      joint_names:
+      - joint7
+      - joint8
+    grasp:
+      # Pre-unification values from the saved 2026-10-16 tool diagnosis.
+      tip_offset_m: 0.015
+      finger_length_m: 0.10
+      finger_thickness_m: 0.01
+      finger_height_m: 0.02
+      pad_length_m: 0.03
+      transform_grasp_tool_translation: [-0.015, 0.0, 0.0]
+      approach_axis: x
+      pregrasp_distance_m: 0.05
+      lift_distance_m: 0.08
+      retreat_distance_m: 0.08
+      max_pregrasp_z: 0.11
+      orientation_mode: graspnet
+      template_rpy:
+      - 0.0
+      - 1.45
+      - 0.0
+      tcp_backoff_m: 0.015
+      template_pregrasp_distance_m: 0.04
+      min_tool0_height_m: 0.02
+      transit_pitches:
+      - 1.15
+      - 0.9
+      place_pitches:
+      - 1.45
+      - 1.15
+      - 0.9
+      - 0.75
+      place_release_clearances_m:
+      - 0.01
+      - 0.015
+      - 0.018
+      - 0.02
+      max_approach_z: 0.35
+      allow_reachable_fallback: true
+      pitch_ladder:
+      - 1.45
+      - 1.15
+      - 0.9
+      - 0.75
+      - 0.6
+      - 0.5
+      yaw_ladder_deg:
+      - 0
+      - 45
+      - -45
+      - 180
+      min_score: 0.15
+      template_fallback: true
+      place_offset_search_m: 0.03
+      place_offset_step_m: 0.015
+      place_offset_max_points: 9
+      native_budget_fraction: 0.45
+      # Static scene: execute from the planned observation without another SAM call.
+      pre_execution_visual_recheck: false
+      align_cube_edges: true
+      allow_cube_face_change: true
+      transport_clearance_m: 0.08
+      place_orientation_in_transit: true
+      max_target_motion_m: 0.01
+      max_capture_to_execute_s: 60.0
+      center_band_enabled: false
+    poses:
+      ready_joints:
+      - 0.817692756652832
+      - 0.6715879440307617
+      - 0.8302812576293945
+      - -1.0362787246704102
+      - 0.051690101623535156
+      - 0.06389713287353516
+      hold_joints:
+      - 0.817692756652832
+      - 0.6715879440307617
+      - 0.8302812576293945
+      - -1.0362787246704102
+      - 0.051690101623535156
+      - 0.06389713287353516
+    interaction:
+      carry_to_ready: true
+    safety:
+      plan_only: true
+      tcp_mapping_confirmed: true
+      require_table_collision: true
+      require_camera_collision: true
+    moveit:
+      ik_solver: trac_ik  # Speed mode; kdl remains selectable at launch.
+      ik_solve_type: Speed
+      planning_pipelines: [ompl, pilz_industrial_motion_planner, chomp]
+    planning:
+      enabled: true
+      group: arm
+      pipeline_id: ompl
+      planner_id: RRTConnect
+      tcp_frame: wrist_preview/tool0
+      move_group_action: /wrist_pick/move_action
+      compute_ik_service: /wrist_pick/compute_ik
+      state_validity_service: /wrist_pick/check_state_validity
+      apply_scene_service: /wrist_pick/apply_planning_scene
+      allowed_time_s: 5.0
+      result_timeout_s: 30.0
+      ik_timeout_s: 0.15
+      attempts: 4
+      # Wrist transit speed; precision/lift increased at the user's request.
+      velocity_scaling: 0.82
+      acceleration_scaling: 0.43
+      transit_velocity_scaling: 0.82
+      transit_acceleration_scaling: 0.43
+      precision_velocity_scaling: 0.45
+      precision_acceleration_scaling: 0.25
+      lift_retreat_velocity_scaling: 0.55
+      lift_retreat_acceleration_scaling: 0.32
+      position_tolerance_m: 0.003
+      orientation_tolerance_rad: 0.05
+      cartesian_step: 0.003
+      min_cartesian_fraction: 0.9999
+      total_budget_s: 8.0
+      observe_retry: true
+      observe_budget_s: 2.0
+      geometry_workers: 2
+      # Low tabletop objects also need shallow approaches; recorded failures
+      # solved at 0.50/0.60 rad with the bounded finger/table contact policy.
+      low_target_pitch_order: [0.5, 0.6, 0.75, 0.9, 1.15, 1.45]
+      parallel_ik_service: /wrist_sam/parallel_ik/solve
+      parallel_ik_workers: 4
+      parallel_ik_fallback_serial: true
+      reuse_planning_prefix: true
+      # Available for difficult IK branches; recorded scenes showed no benefit.
+      approach_branch_recovery: false
+      cube_alignment_budget_s: 2.0
+      reachability_table: /home/quella/arx/wrist_ws/models/sam_reachability_not_calibrated.json
+    scene:
+      # Only fingers may enter this 5 mm model uncertainty band. A second box
+      # enforces its lower boundary; the physical table stays at its measured height.
+      table_contact_tolerance_m: 0.005
+      table_touch_links: [wrist_preview/link7, wrist_preview/link8]
+      table_center:
+      - 0.25
+      - 0.3
+      - -0.026
+      table_size:
+      - 0.52
+      - 0.72
+      - 0.04
+      camera_size:
+      - 0.128
+      - 0.033
+      - 0.04795001
+      camera_center_in_camera_link:
+      - 0.008
+      - 0.0
+      - -0.0174101052
+      camera_frame: wrist_camera_color_optical_frame
+      camera_mount: eye_in_hand
+      camera_mount_link: wrist_preview/tool0
+      camera_touch_links:
+      - wrist_preview/link6
+      - wrist_preview/tool0
+      camera_model_link: wrist_preview/camera_payload
+    markers:
+      topic: /wrist_sam/candidates
+      axis_length_m: 0.06
+      axis_diameter_m: 0.006
+      lifetime_s: 60.0
+    capture:
+      directory: /home/quella/.local/share/x5a_remote_grasp/wrist_captures
+    action_name: /x5a_remote_grasp/plan
+    health_service: /x5a_remote_grasp/health
+    save_snapshot_service: /x5a_remote_grasp/save_snapshot
+    execution:
+      enabled: false
+      # User accepts ordinary grab/place accuracy: log TCP deviation without
+      # blocking closure/release after a successful controller trajectory.
+      enforce_tcp_tolerance: false
+      plan_joint_moves: true
+      trajectory_timeout_s: 120.0

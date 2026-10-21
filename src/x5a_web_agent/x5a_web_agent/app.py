@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextvars import ContextVar
 import os
 import socket
 import subprocess
@@ -20,7 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from x5a_web_agent.asr import WhisperSpeechToText, create_asr
+from x5a_web_agent.asr import create_asr
 from x5a_web_agent.cloud_parse import parse_text as cloud_parse_text
 from x5a_web_agent.cloud_parse import enabled as cloud_parse_enabled
 from x5a_web_agent.command_parser import (
@@ -45,6 +46,7 @@ from x5a_web_agent.mqtt_start import (
 from x5a_web_agent.ros_bridge import BUSY_MESSAGE, RosBridge
 from x5a_web_agent.session import Session
 from x5a_web_agent.terminal import TerminalBackend, TerminalConsole
+from x5a_web_agent.task_sequence import CommandRun, describe_task, split_sequence, sequence_state_error
 from x5a_web_agent.text_forward import enabled as text_forward_enabled
 from x5a_web_agent.text_forward import forward_text, forward_url
 
@@ -105,15 +107,30 @@ STAGE_ZH = {
     "CANDIDATE_CHECK": "正在筛选抓取候选",
     "CANDIDATE_REJECT": "该候选被拒，尝试下一个",
     "REMOTE_IK": "正在做碰撞感知 IK",
-    "REMOTE_PLAN": "正在做 MoveIt 纯规划",
-    "REMOTE_EXECUTE": "正在执行抓取动作",
+    "REMOTE_PLAN": "正在规划完整抓放路径",
+    "OBSERVE_PLANNED": "规划超时，准备靠近后重新观察",
+    "EXEC_OBSERVE": "移动到附近观察位",
+    "REOBSERVE": "已靠近，重新拍摄并规划",
+    "REMOTE_EXECUTE": "正在执行抓放轨迹",
+    'SELECTED_NATIVE': '已选中 GraspNet 抓取姿态',
+    'SELECTED_GEOMETRIC': '已选中几何保底抓取姿态',
     "POSE_MOVE": "正在调整姿态",
     "PLACE_LOCATE": "正在定位放置目标",
     "TRANSPORT": "正在搬运到放置点",
     "PLACE": "正在放置",
+    'CANCELED': '已取消，后续步骤停止',
+    'EXEC_OPEN_GRIPPER': '张开夹爪',
+    'EXEC_PREGRASP': '移动到预抓取位置',
+    'EXEC_GRASP': '直线接近物体',
+    'EXEC_CLOSE_GRIPPER': '闭合夹爪并检查持物',
+    'EXEC_LIFT': '提起物体',
+    'EXEC_TRANSPORT': '搬运到放置点',
+    'EXEC_PLACE': '下降到释放位置',
+    'EXEC_RELEASE': '松开夹爪',
+    'EXEC_RETREAT': '撤离物体',
 }
 
-TERMINAL_STAGES = frozenset({"SUCCESS", "FAILED", "DRY_RUN", "IDLE"})
+TERMINAL_STAGES = frozenset({"SUCCESS", "FAILED", "CANCELED", "DRY_RUN", "IDLE"})
 
 
 def _package_dir() -> Path:
@@ -121,13 +138,17 @@ def _package_dir() -> Path:
 
 
 def static_dir() -> Path:
+    sam = _package_dir() / 'static_sam'
+    if sam.is_dir():
+        return sam
     here = _package_dir() / "static"
     if here.is_dir():
         return here
     try:
         from ament_index_python.packages import get_package_share_directory
 
-        return Path(get_package_share_directory("x5a_web_agent")) / "static"
+        share = Path(get_package_share_directory("x5a_web_agent"))
+        return share/'static_sam' if (share/'static_sam').is_dir() else share/'static'
     except Exception:
         return here
 
@@ -178,6 +199,9 @@ class ConnectionHub:
             self._clients.discard(ws)
 
     async def broadcast(self, payload: Dict[str, Any]) -> None:
+        run = _run_context.get() or _active_run
+        if run is not None:
+            payload = {**payload, **run.context()}
         async with self._lock:
             clients = list(self._clients)
         stale: List[WebSocket] = []
@@ -193,6 +217,10 @@ class ConnectionHub:
         self._notify_observers(payload)
 
     async def update(self, **kwargs: Any) -> None:
+        if _active_run is not None and kwargs.get('busy') is False:
+            # A step result or a carry-to-ready transition is not the end of
+            # the owning command. Keep other input channels out until it ends.
+            kwargs.update(busy=True, robot_state='BUSY')
         self.state.update(kwargs)
         if "stage" in kwargs:
             self.state["stage_zh"] = STAGE_ZH.get(
@@ -218,8 +246,11 @@ bridge: Optional[RosBridge] = None
 # 多轮交互会话（内存态）：记住夹爪里拿着什么，让「放到白色方块上」这类
 # 后续指令能接着上一步动作执行。真相在执行器（execute 返回 holding）。
 session = Session()
+_active_run: Optional[CommandRun] = None
+_run_context: ContextVar = ContextVar('sam_command_run', default=None)
+_command_number = 0
 _MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
-asr_backend = create_asr(os.environ.get("X5A_ASR_BACKEND", "whisper"))
+asr_backend = create_asr(os.environ.get("X5A_ASR_BACKEND", "sensevoice"))
 
 
 async def _sync_session_state() -> None:
@@ -300,17 +331,17 @@ async def _startup() -> None:
     # 会话状态是 agent 进程内存里的镜像，重启会丢。执行器才是「手里有没有
     # 东西」的真相，所以启动时问一次，把状态对齐回来。
     threading.Thread(target=_resync_session, name="x5a-session-sync", daemon=True).start()
-    if isinstance(asr_backend, WhisperSpeechToText):
+    if callable(getattr(asr_backend, "preload", None)):
         def _preload() -> None:
             try:
-                print("[x5a_web_agent] loading faster-whisper small ...")
+                print(f"[启动] 正在加载语音模型 {asr_backend.name} ...", flush=True)
                 asr_backend.preload()
-                print("[x5a_web_agent] faster-whisper ready")
+                print(f"[启动] 语音模型 {asr_backend.name} 已就绪", flush=True)
             except Exception as exc:
                 asr_backend.error = str(exc)
-                print(f"[x5a_web_agent] faster-whisper load failed: {exc}")
+                print(f"[启动失败] 语音模型 {asr_backend.name}：{exc}", flush=True)
 
-        threading.Thread(target=_preload, name="x5a-whisper", daemon=True).start()
+        threading.Thread(target=_preload, name="x5a-asr", daemon=True).start()
 
 
 @app.on_event("shutdown")
@@ -340,12 +371,15 @@ def _resync_session() -> None:
         session.hold(prompt="(重启前夹持的物体)")
     elif holding is False and session.holding:
         session.clear("executor says the gripper is empty")
-    print(
-        f"[x5a_web_agent] session resync: holding={holding} "
-        f"stages={state.get('plan_stages')}"
-    )
     if _MAIN_LOOP is not None:
-        asyncio.run_coroutine_threadsafe(_sync_session_state(), _MAIN_LOOP)
+        ready = bridge.server_ready(0.3)
+        async def announce():
+            await _sync_session_state()
+            await hub.update(server_ready=ready)
+            await hub.broadcast({'type': 'info', 'message':
+                ('规划和执行服务已就绪' if ready else '规划/执行服务尚未就绪，请检查详细日志')
+                + ('；夹爪持物' if holding is True else '；夹爪为空' if holding is False else '；持物状态未知')})
+        asyncio.run_coroutine_threadsafe(announce(), _MAIN_LOOP)
 
 
 @app.get("/")
@@ -441,10 +475,13 @@ async def api_cancel() -> Dict[str, Any]:
 def _request_cancel() -> Dict[str, Any]:
     waiting = str(hub.state.get("stage") or "") == "WAITING_START"
     cancel_mqtt_start_wait()
+    if _active_run is not None:
+        _active_run.cancelled.set()
     ok = _bridge().cancel()
     if waiting:
         return {"ok": True, "message": "已取消等待数字人开始标志"}
-    return {"ok": ok, "message": "已请求停止当前任务" if ok else "当前没有可取消的任务"}
+    ok = ok or _active_run is not None
+    return {"ok": ok, "message": "已请求停止；当前动作结束后不再执行后续步骤" if ok else "当前没有可取消的任务"}
 
 
 @app.websocket("/ws")
@@ -511,6 +548,11 @@ def _convert_to_remote_chain(parsed: Dict[str, Any]) -> Dict[str, Any]:
 
 async def handle_text_command(text: str) -> Dict[str, Any]:
     transcript = (text or "").strip()
+    if (_active_run is not None or hub.state.get('busy')) and not any(
+            keyword in transcript.lower() for keyword in _CANCEL_KEYWORDS):
+        payload = {'ok': False, 'type': 'error', 'message': BUSY_MESSAGE}
+        await hub.broadcast(payload)
+        return payload
     await hub.update(transcript=transcript)
     await hub.broadcast({"type": "transcript", "text": transcript})
     parsed = await _cloud_parse_command(transcript)
@@ -519,16 +561,34 @@ async def handle_text_command(text: str) -> Dict[str, Any]:
     return await dispatch_parsed(parsed, source_text=transcript)
 
 
-async def _cloud_parse_command(transcript: str) -> Dict[str, Any]:
+async def _cloud_parse_command(transcript: str, *, _allow_sequence=True) -> Dict[str, Any]:
     """All semantic parsing goes through the cloud LLM gateway. Local shortcuts
     are limited to words that must work offline (cancel/home/ready) plus the
     multi-turn follow-ups, which the stateless cloud gateway cannot resolve."""
     lowered = transcript.lower()
     if any(keyword in lowered for keyword in _CANCEL_KEYWORDS):
         return {"action": "cancel", "source": "local"}
+    if _allow_sequence:
+        try:
+            clauses = split_sequence(transcript)
+        except ValueError as exc:
+            return {'action': 'unknown', 'message': str(exc)}
+        if clauses:
+            tasks = await asyncio.gather(*(
+                _cloud_parse_command(clause, _allow_sequence=False) for clause in clauses))
+            for index, (clause, task) in enumerate(zip(clauses, tasks), 1):
+                if task.get('action') not in {'remote_grasp', 'remote_place', 'release',
+                                              'pick_place', 'go_ready', 'go_home'}:
+                    return {'action': 'unknown', 'source': 'sequence',
+                        'message': f'第 {index} 步“{clause}”无法解析，整条指令未执行：'
+                                   + str(task.get('message') or '请明确抓取物和放置目标')}
+                task['source_text'] = clause
+            return {'action': 'sequence', 'tasks': tasks, 'source': 'sequence'}
     if any(keyword in lowered for keyword in _HOME_KEYWORDS):
         return {"action": "go_home", "source": "local"}
     if any(keyword in lowered for keyword in _READY_KEYWORDS):
+        if '镜像' in transcript and _grasp_route() == 'remote':
+            return {'action': 'unknown', 'message': 'SAM 模式目前只配置了当前侧观察位，请说“准备”'}
         return {"action": "go_ready", "source": "local"}
     if not transcript:
         return {"action": "unknown", "message": "没有收到指令内容"}
@@ -544,7 +604,7 @@ async def _cloud_parse_command(transcript: str) -> Dict[str, Any]:
         cloud = await loop.run_in_executor(None, lambda: cloud_parse_text(transcript))
     except Exception:
         cloud = None
-    mapped = _map_cloud_result(cloud)
+    mapped = _map_cloud_result(cloud, transcript)
     if mapped is not None:
         return mapped
     if _grasp_route() == "rule":
@@ -579,10 +639,14 @@ async def _resolve_follow_up(
         except Exception:
             cloud = None
         if isinstance(cloud, dict):
-            normalized = str(cloud.get("sam_prompt") or "").strip()
+            # A place response can retain the held object's name in
+            # sam_prompt (e.g. cube), while place_prompt names the box.
+            # Resolve the destination before falling back to older schemas.
+            normalized = (_optional_cloud_text(cloud.get("place_prompt"))
+                          or _optional_cloud_text(cloud.get("sam_prompt")))
             if not normalized:
-                color = str(cloud.get("color") or "").strip()
-                obj = str(cloud.get("object") or "").strip()
+                color = _optional_cloud_text(cloud.get("color"))
+                obj = _optional_cloud_text(cloud.get("object"))
                 normalized = f"{color} {obj}".strip()
             if normalized:
                 target = normalized
@@ -605,18 +669,24 @@ _HOME_KEYWORDS = ("归位", "归零", "回位", "复位", "回原点", "回家",
 _READY_KEYWORDS = ("准备", "预备", "就位", "ready")
 
 
-def _map_cloud_result(cloud: Any) -> Optional[Dict[str, Any]]:
+def _optional_cloud_text(value: Any) -> str:
+    # Some gateway responses encode JSON null as the string "null".
+    text = value.strip() if isinstance(value, str) else ""
+    return "" if text.lower() in {"null", "none", "undefined"} else text
+
+
+def _map_cloud_result(cloud: Any, source_text: str = "") -> Optional[Dict[str, Any]]:
     """Map the cloud /parse result onto a plan-only remote_grasp task.
 
     Every grasp intent uses the remote SAM+GraspNet chain; only the object
     name/color determine the SAM prompt."""
     if not isinstance(cloud, dict):
         return None
-    obj = str(cloud.get("object") or "").strip().lower()
+    obj = _optional_cloud_text(cloud.get("object")).lower()
     if not obj:
         return None
-    color = str(cloud.get("color") or "").strip().lower() or None
-    action = str(cloud.get("action") or "pick").strip().lower()
+    color = _optional_cloud_text(cloud.get("color")).lower() or None
+    action = _optional_cloud_text(cloud.get("action")).lower() or "pick"
     if action in {"cancel", "stop"}:
         return {"action": "cancel", "source": "cloud"}
     if action in {"pick", "place", "grasp", "handover"}:
@@ -631,13 +701,21 @@ def _map_cloud_result(cloud: Any) -> Optional[Dict[str, Any]]:
             }
         # 云端把关系指代拆成 目标短语(sam_prompt) + 参照物短语(reference_prompt)，
         # 用 "| ref:" 编码进 prompt，由抓取服务做两段式几何定位。
-        sam = str(cloud.get("sam_prompt") or "").strip() or (
+        sam = _optional_cloud_text(cloud.get("sam_prompt")) or (
             f"{color} {obj}".strip() if color else obj
         )
-        reference = str(cloud.get("reference_prompt") or "").strip()
-        relation = str(cloud.get("relation") or "").strip()
-        place = str(cloud.get("place_prompt") or "").strip()
-        place_rel = str(cloud.get("place_rel") or "").strip() or "in"
+        reference = _optional_cloud_text(cloud.get("reference_prompt"))
+        relation = _optional_cloud_text(cloud.get("relation"))
+        place = _optional_cloud_text(cloud.get("place_prompt"))
+        place_rel = _optional_cloud_text(cloud.get("place_rel")) or "in"
+        # Correct the observed 钳子 -> clamp mistranslation only for a simple
+        # target. Relational commands and actual 夹具/台钳 keep their cloud names.
+        if (obj in {"clamp", "clamps", "plier"}
+                and any(word in source_text for word in ("钳子", "尖嘴钳"))
+                and not any(word in source_text for word in ("夹具", "夹钳", "台钳", "clamp"))
+                and not reference and not place):
+            obj = "pliers"
+            sam = f"{color} pliers" if color else "pliers"
         if reference:
             prompt = f"{sam} | ref: {reference}"
             if relation:
@@ -665,7 +743,7 @@ async def _cloud_parse_fallback(text: str) -> Optional[Dict[str, Any]]:
         cloud = await loop.run_in_executor(None, lambda: cloud_parse_text(text))
     except Exception:
         return None
-    return _map_cloud_result(cloud)
+    return _map_cloud_result(cloud, text)
 
 
 async def handle_structured_task(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -748,7 +826,75 @@ async def _fail_before_motion(payload: Dict[str, Any], parsed: Dict[str, Any]) -
     return payload
 
 
-async def dispatch_parsed(
+def _cancelled() -> bool:
+    run = _run_context.get()
+    return run is not None and run.cancelled.is_set()
+
+
+def _motion_if_active(run, function):
+    if run is not None and run.cancelled.is_set():
+        return {'success': False, 'stage': 'CANCELED', 'message': '已取消，未提交后续动作'}
+    return function()
+
+
+def _schedule_command(coro) -> None:
+    run = _active_run
+    if run is None:
+        raise RuntimeError('任务未取得执行权')
+    run.scheduled = True
+    asyncio.create_task(_own_command(coro, run))
+
+
+async def _own_command(coro, run) -> None:
+    global _active_run
+    token = _run_context.set(run)
+    try:
+        await coro
+    except Exception as exc:
+        result = {'success': False, 'stage': 'FAILED', 'message': f'任务异常：{exc}'}
+        await hub.update(stage='FAILED', last_result=result)
+        await hub.broadcast({'type': 'result', **result, 'ok': False, 'parsed': run.parsed})
+    finally:
+        if _active_run is run:
+            _active_run = None
+            await hub.update(busy=False, robot_state='IDLE', queue_active=False,
+                             **run.context())
+        _run_context.reset(token)
+
+
+async def dispatch_parsed(parsed: Dict[str, Any], source_text: str = '') -> Dict[str, Any]:
+    global _active_run, _command_number
+    if parsed.get('action') in {'unknown', 'cancel'}:
+        return await _dispatch_parsed(parsed, source_text)
+    if (_active_run is not None or hub.state.get('busy') or _bridge().busy):
+        payload = {'ok': False, 'type': 'error', 'message': BUSY_MESSAGE, 'parsed': parsed}
+        await hub.broadcast(payload)
+        return payload
+    if parsed.get('action') == 'sequence':
+        if not isinstance(parsed.get('tasks'), list) or any(not isinstance(task, dict) for task in parsed['tasks']):
+            payload = {'ok': False, 'type': 'error', 'message': '任务序列格式无效', 'parsed': parsed}
+            await hub.broadcast(payload)
+            return payload
+        parsed = {**parsed, 'tasks': [_convert_to_remote_chain(dict(task))
+                                    for task in parsed['tasks']]}
+        error = sequence_state_error(parsed['tasks'], session.holding)
+        if error:
+            payload = {'ok': False, 'type': 'error', 'message': error, 'parsed': parsed}
+            await hub.broadcast(payload)
+            return payload
+    _command_number += 1
+    run = CommandRun(_command_number, parsed,
+                     step_total=len(parsed.get('tasks', [])) if parsed.get('action') == 'sequence' else 1)
+    _active_run = run  # reserve before the first await
+    hub.state.update(run.context())
+    try:
+        return await _dispatch_parsed(parsed, source_text)
+    finally:
+        if not run.scheduled and _active_run is run:
+            _active_run = None
+
+
+async def _dispatch_parsed(
     parsed: Dict[str, Any],
     source_text: str = "",
 ) -> Dict[str, Any]:
@@ -763,18 +909,11 @@ async def dispatch_parsed(
         await hub.broadcast(payload)
         return payload
     if action == "cancel":
-        waiting = str(hub.state.get("stage") or "") == "WAITING_START"
-        cancel_mqtt_start_wait()
-        ok = _bridge().cancel()
-        if waiting:
-            message = "已取消等待数字人开始标志"
-            ok = True
-        else:
-            message = "已请求停止当前任务" if ok else "当前没有可取消的任务"
+        request = _request_cancel()
         payload = {
-            "ok": ok,
+            "ok": request['ok'],
             "type": "info",
-            "message": message,
+            "message": request['message'],
             "parsed": parsed,
         }
         await hub.broadcast(payload)
@@ -804,18 +943,14 @@ async def dispatch_parsed(
         await hub.update(
             robot_state="BUSY", busy=True, stage=stage, queue_active=True
         )
-        asyncio.create_task(_run_linked_task_queue(tasks, parsed, source_text))
-        tasks = [_convert_to_remote_chain(dict(item)) for item in tasks]
-        names = "、".join(
-            str(item.get("prompt") or item.get("target_color") or "?") for item in tasks
-        )
+        _schedule_command(_run_linked_task_queue(tasks, parsed, source_text))
         payload = {
             "ok": True,
             "type": "info",
             "message": (
-                f"等待数字人播报完成后开始：{names}"
+                f"等待数字人播报完成后开始，共 {len(tasks)} 步"
                 if handshake
-                else f"已加入{len(tasks)}个任务：{names}"
+                else f"已接受连续任务，共 {len(tasks)} 步"
             ),
             "parsed": parsed,
             "stage": stage,
@@ -858,11 +993,11 @@ async def dispatch_parsed(
             await hub.broadcast(payload)
             return payload
         await hub.update(robot_state="BUSY", busy=True, stage="ACCEPTED")
-        asyncio.create_task(_run_remote_grasp(prompt, parsed))
+        _schedule_command(_run_remote_grasp(prompt, parsed))
         payload = {
             "ok": True,
             "type": "info",
-            "message": f"已提交远程抓取规划：{prompt}（仅规划与可视化，不执行运动）",
+            "message": ('开始：' if auto_execute_enabled() else '仅规划：') + describe_task(parsed),
             "parsed": parsed,
             "stage": "ACCEPTED",
             "stage_zh": STAGE_ZH["ACCEPTED"],
@@ -882,7 +1017,7 @@ async def dispatch_parsed(
         prompt = str(parsed.get("prompt") or "").strip()
         if not _bridge().busy or hub.state.get("stage") in TERMINAL_STAGES:
             await hub.update(robot_state="BUSY", busy=True, stage="ACCEPTED")
-            asyncio.create_task(_run_remote_place(prompt, parsed))
+            _schedule_command(_run_remote_place(prompt, parsed))
             payload = {
                 "ok": True,
                 "type": "info",
@@ -913,7 +1048,7 @@ async def dispatch_parsed(
             await hub.broadcast(payload)
             return payload
         await hub.update(robot_state="BUSY", busy=True, stage="ACCEPTED", last_result=None)
-        asyncio.create_task(_run_release(parsed))
+        _schedule_command(_run_release(parsed))
         payload = {
             "ok": True,
             "type": "info",
@@ -935,7 +1070,7 @@ async def dispatch_parsed(
             await hub.broadcast(payload)
             return payload
         await hub.update(robot_state="BUSY", busy=True, stage="ACCEPTED")
-        asyncio.create_task(_run_pose_move(action, parsed))
+        _schedule_command(_run_pose_move(action, parsed))
         label = "归位 (Home)" if action == "go_home" else "预抓取就绪姿态"
         payload = {
             "ok": True,
@@ -981,7 +1116,7 @@ async def dispatch_parsed(
     handshake = _needs_digital_human_handshake(source_text)
     stage = "WAITING_START" if handshake else "ACCEPTED"
     await hub.update(robot_state="BUSY", busy=True, stage=stage)
-    asyncio.create_task(_run_linked_pick_place(str(color), parsed, source_text))
+    _schedule_command(_run_linked_pick_place(str(color), parsed, source_text))
     payload = {
         "ok": True,
         "type": "info",
@@ -1006,14 +1141,15 @@ async def _announce_motion_start() -> None:
     )
 
 
-async def _run_pose_move(action: str, parsed: Dict[str, Any]) -> None:
+async def _run_pose_move(action: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
     loop = asyncio.get_running_loop()
     fn = _bridge().pose_home if action == "go_home" else _bridge().pose_ready
     try:
-        result = await loop.run_in_executor(None, fn)
+        result = await loop.run_in_executor(None, _motion_if_active, _run_context.get(), fn)
     except Exception as exc:
         result = {"success": False, "message": f"ROS bridge exception: {exc}", "stage": "FAILED"}
     success = bool(result.get("success"))
+    result = dict(result, at_observation_pose=success and action == 'go_ready')
     stage = "SUCCESS" if success else "FAILED"
     # 归位/就位不动夹爪：手里有东西时照样保持夹持（按用户要求带着物体归位）
     await hub.update(robot_state="IDLE", busy=False, stage=stage, last_result=result)
@@ -1022,18 +1158,21 @@ async def _run_pose_move(action: str, parsed: Dict[str, Any]) -> None:
         "message": result.get("message"), "stage": stage,
         "stage_zh": STAGE_ZH.get(stage, stage), "parsed": parsed,
     })
+    return result
 
 
-async def _carry_to_ready() -> None:
+async def _carry_to_ready() -> Dict[str, Any]:
     """抓住物体后移到 hold 姿态等下一句指令。
 
-    相机是 eye-to-hand 固定安装的，手臂和手里的物体悬在原位会挡住后续
-    /v1/locate 的视野，所以抓完先让开到 ready 姿态。"""
+    腕部相机随手臂移动；回到观察位后才能稳定观察后续放置目标。"""
     if not carry_to_ready_enabled():
-        return
+        return {'success': True, 'at_observation_pose': False}
+    if _cancelled():
+        return {'success': False, 'message': '已取消后续观察位动作', 'stage': 'CANCELED'}
+    await hub.update(robot_state='BUSY', busy=True, stage='MOVE_READY')
     loop = asyncio.get_running_loop()
     try:
-        result = await loop.run_in_executor(None, lambda: _bridge().pose_ready())
+        result = await loop.run_in_executor(None, _motion_if_active, _run_context.get(), _bridge().pose_ready)
     except Exception as exc:
         result = {"success": False, "message": f"ROS bridge exception: {exc}"}
     if not result.get("success"):
@@ -1041,6 +1180,7 @@ async def _carry_to_ready() -> None:
             "type": "info",
             "message": f"已抓住物体，但移到等待姿态失败：{result.get('message')}",
         })
+    return dict(result, at_observation_pose=bool(result.get('success')))
 
 
 def carry_to_ready_enabled() -> bool:
@@ -1054,24 +1194,42 @@ async def _run_remote_grasp(
     prompt: str,
     parsed: Dict[str, Any],
     on_done=None,
-) -> None:
+) -> Dict[str, Any]:
     """Plan-only SAM + GraspNet task: cloud inference, TF, markers, optional
     MoveIt planning. The remote node never executes motion.
 
     执行结果以执行器返回的 holding 为准：合爪未张 = 手里有东西（抓取流），
     张爪放完 = 手里空了（一步抓放流）。会话状态据此更新。"""
+    started = time.monotonic()
     loop = asyncio.get_running_loop()
+    run = _run_context.get()
+    step = run.step_index if run else None
 
     def on_feedback(stage: str) -> None:
-        asyncio.run_coroutine_threadsafe(_apply_stage(stage), loop)
+        asyncio.run_coroutine_threadsafe(_apply_stage(
+            stage, command_id=run.number if run else None, step_index=step), loop)
 
     try:
-        result = await loop.run_in_executor(
-            None,
-            lambda: _bridge().send_remote_grasp(
-                prompt, on_feedback=on_feedback, plan_motion=True
-            ),
-        )
+        for attempt in range(2):
+            if _cancelled():
+                result = dict(success=False, stage='CANCELED', message='已取消')
+                break
+            result = await loop.run_in_executor(None, lambda: _bridge().send_remote_grasp(
+                prompt, on_feedback=on_feedback, plan_motion=True))
+            if not result.get('recovery_only'):
+                break
+            if (attempt or not auto_execute_enabled() or getattr(_bridge(), 'dry_run', False)):
+                result = dict(result, success=False, plan_valid=False,
+                              message='尚无完整抓放轨迹；已达到观察重试上限' if attempt else
+                                      '已生成观察轨迹，演练模式不移动机械臂')
+                break
+            await _apply_stage('EXEC_OBSERVE')
+            moved = await loop.run_in_executor(None, _motion_if_active, _run_context.get(),
+                                                _bridge().execute_latest)
+            if not moved.get('success') or moved.get('holding'):
+                result = dict(moved, success=False, message='观察位移动未完成：'+str(moved.get('message') or '状态异常'))
+                break
+            await _apply_stage('REOBSERVE')
     except Exception as exc:
         result = {
             "success": False,
@@ -1079,7 +1237,12 @@ async def _run_remote_grasp(
             "stage": "FAILED",
         }
     executed = False
-    if result.get("success") and auto_execute_enabled():
+    planning_s = time.monotonic()-started
+    if _cancelled():
+        result = {'success': False, 'stage': 'CANCELED', 'message': '已取消，未开始执行此规划'}
+    if result.get('success') and result.get('plan_valid') is False and auto_execute_enabled():
+        result = {**result, 'success': False, 'stage': 'FAILED', 'message': '未生成有效轨迹，未执行动作'}
+    if result.get("success") and auto_execute_enabled() and not getattr(_bridge(), 'dry_run', False):
         # 规划成功 → 自动触发执行器（真机动作）。执行器侧仍有独立安全门：
         # enabled 开关、规划 180 秒新鲜度、/arm_cmd 发布者数量校验。
         await hub.update(robot_state="BUSY", busy=True, stage="REMOTE_EXECUTE")
@@ -1093,7 +1256,7 @@ async def _run_remote_grasp(
         )
         try:
             exec_result = await loop.run_in_executor(
-                None, lambda: _bridge().execute_latest()
+                None, _motion_if_active, _run_context.get(), _bridge().execute_latest
             )
         except Exception as exc:
             exec_result = {
@@ -1107,10 +1270,6 @@ async def _run_remote_grasp(
         result["message"] = exec_result.get("message") or result.get("message")
         result["stage"] = exec_result.get("stage") or result.get("stage")
         result["holding"] = exec_result.get("holding")
-    success = bool(result.get("success"))
-    stage = "SUCCESS" if success else str(result.get("stage") or "FAILED")
-    if stage == "BUSY":
-        stage = "FAILED"
     if executed:
         session.observe_executor(
             result, prompt=prompt, object_name=str(parsed.get('object') or ''),
@@ -1118,6 +1277,19 @@ async def _run_remote_grasp(
             width_m=float(result.get('gripper_width_m') or 0.0),
         )
         await _sync_session_state()
+    if result.get('success') and executed and session.holding:
+        carry = await _carry_to_ready()
+        result['at_observation_pose'] = carry.get('at_observation_pose', False)
+        if not carry.get('success'):
+            result.update(success=False, stage=carry.get('stage') or 'FAILED',
+                          message='抓取后返回观察位未完成：'+str(carry.get('message') or '未知原因'))
+    result = dict(result, planning_s=round(planning_s, 2),
+                  duration_s=round(time.monotonic()-started, 2), executed=executed)
+    success = bool(result.get("success"))
+    stage = ("SUCCESS" if executed else "DRY_RUN") if success else str(result.get("stage") or "FAILED")
+    if stage == "BUSY":
+        stage = "FAILED"
+    result['stage'] = stage
     await hub.update(
         robot_state="IDLE",
         busy=False,
@@ -1135,28 +1307,33 @@ async def _run_remote_grasp(
             "parsed": parsed,
             "holding": session.holding,
             "held_object": session.as_dict()["held_object"],
+            'duration_s': result['duration_s'], 'planning_s': result['planning_s'],
         }
     )
-    if success and executed and session.holding:
-        await _carry_to_ready()
     if on_done is not None:
         await on_done(
             {
                 "ok": success,
+                "success": success,
                 "message": result.get("message"),
                 "stage": stage,
                 "stage_zh": STAGE_ZH.get(stage, stage),
             }
         )
+    return result
 
 
-async def _run_remote_place(prompt: str, parsed: Dict[str, Any]) -> None:
+async def _run_remote_place(prompt: str, parsed: Dict[str, Any]) -> Dict[str, Any]:
     """放置流：物体已经在夹爪里，只定位放置目标并规划 TRANSPORT/PLACE/RETREAT
     三段（节点侧的纯放置模式，不重新抓取）。"""
+    started = time.monotonic()
     loop = asyncio.get_running_loop()
+    run = _run_context.get()
+    step = run.step_index if run else None
 
     def on_feedback(stage: str) -> None:
-        asyncio.run_coroutine_threadsafe(_apply_stage(stage), loop)
+        asyncio.run_coroutine_threadsafe(_apply_stage(
+            stage, command_id=run.number if run else None, step_index=step), loop)
 
     relation = str(parsed.get("relation") or "on")
     try:
@@ -1168,7 +1345,13 @@ async def _run_remote_place(prompt: str, parsed: Dict[str, Any]) -> None:
         )
     except Exception as exc:
         result = {"success": False, "message": f"ROS bridge exception: {exc}", "stage": "FAILED"}
-    if result.get("success") and auto_execute_enabled():
+    planning_s = time.monotonic()-started
+    executed = False
+    if _cancelled():
+        result = {'success': False, 'stage': 'CANCELED', 'message': '已取消，未开始执行此放置规划'}
+    if result.get('success') and result.get('plan_valid') is False and auto_execute_enabled():
+        result = {**result, 'success': False, 'stage': 'FAILED', 'message': '未生成有效放置轨迹，未执行动作'}
+    if result.get("success") and auto_execute_enabled() and not getattr(_bridge(), 'dry_run', False):
         await hub.update(robot_state="BUSY", busy=True, stage="REMOTE_EXECUTE")
         await hub.broadcast({
             "type": "status", "stage": "REMOTE_EXECUTE",
@@ -1176,7 +1359,7 @@ async def _run_remote_place(prompt: str, parsed: Dict[str, Any]) -> None:
         })
         try:
             exec_result = await loop.run_in_executor(
-                None, lambda: _bridge().execute_latest()
+                None, _motion_if_active, _run_context.get(), _bridge().execute_latest
             )
         except Exception as exc:
             exec_result = {"success": False, "message": f"执行器调用异常: {exc}", "stage": "FAILED"}
@@ -1185,10 +1368,14 @@ async def _run_remote_place(prompt: str, parsed: Dict[str, Any]) -> None:
         result["message"] = exec_result.get("message") or result.get("message")
         result["stage"] = exec_result.get("stage") or result.get("stage")
         result["holding"] = exec_result.get("holding")
+        executed = True
+    result = dict(result, planning_s=round(planning_s, 2),
+                  duration_s=round(time.monotonic()-started, 2), executed=executed)
     success = bool(result.get("success"))
-    stage = "SUCCESS" if success else str(result.get("stage") or "FAILED")
+    stage = ("SUCCESS" if executed else "DRY_RUN") if success else str(result.get("stage") or "FAILED")
     if stage == "BUSY":
         stage = "FAILED"
+    result['stage'] = stage
     session.observe_executor(result)
     await _sync_session_state()
     await hub.update(robot_state="IDLE", busy=False, stage=stage, last_result=result)
@@ -1198,14 +1385,16 @@ async def _run_remote_place(prompt: str, parsed: Dict[str, Any]) -> None:
         "stage_zh": STAGE_ZH.get(stage, stage), "parsed": parsed,
         "holding": session.holding,
         "held_object": session.as_dict()["held_object"],
+        'duration_s': result['duration_s'], 'planning_s': result['planning_s'],
     })
+    return result
 
 
-async def _run_release(parsed: Dict[str, Any]) -> None:
+async def _run_release(parsed: Dict[str, Any]) -> Dict[str, Any]:
     """放下：原地张开夹爪，不动手臂。失败时保留持物状态（物体还在手里）。"""
     loop = asyncio.get_running_loop()
     try:
-        result = await loop.run_in_executor(None, lambda: _bridge().release())
+        result = await loop.run_in_executor(None, _motion_if_active, _run_context.get(), _bridge().release)
     except Exception as exc:
         result = {"success": False, "message": f"ROS bridge exception: {exc}", "stage": "FAILED"}
     success = bool(result.get("success"))
@@ -1222,6 +1411,7 @@ async def _run_release(parsed: Dict[str, Any]) -> None:
         "holding": session.holding,
         "held_object": session.as_dict()["held_object"],
     })
+    return result
 
 
 async def _run_linked_pick_place(
@@ -1253,7 +1443,13 @@ async def _run_linked_task_queue(
     await _run_task_queue(tasks, parsed)
 
 
-async def _apply_stage(stage: str) -> None:
+async def _apply_stage(stage: str, command_id=None, step_index=None) -> None:
+    if command_id is not None and (_active_run is None or _active_run.number != command_id
+                                  or _active_run.step_index != step_index):
+        return
+    stage, _, detail = str(stage).partition(':')
+    if stage.startswith('EXEC_') and _active_run is None:
+        return  # late backend feedback must not replace the final result
     if str(hub.state.get("stage") or "") == "WAITING_START":
         return
     terminal = stage in TERMINAL_STAGES
@@ -1261,6 +1457,7 @@ async def _apply_stage(stage: str) -> None:
         robot_state="IDLE" if terminal else "BUSY",
         busy=not terminal,
         stage=stage,
+        stage_detail=detail,
     )
     await hub.broadcast(
         {
@@ -1273,62 +1470,82 @@ async def _apply_stage(stage: str) -> None:
 
 
 async def _run_task_queue(tasks: List[Dict[str, Any]], parsed: Dict[str, Any]) -> None:
-    last = {"success": False, "message": "队列为空", "stage": "FAILED"}
-    for index, task in enumerate(tasks):
-        label = str(task.get("prompt") or task.get("target_color") or "")
-        await hub.broadcast(
-            {
-                "type": "info",
-                "message": f"队列 {index + 1}/{len(tasks)}：抓取 {label}",
-            }
-        )
-        last_item = index == len(tasks) - 1
-        if task.get("action") == "remote_grasp":
-            done_result: Dict[str, Any] = {}
-
-            async def _collect(res: Dict[str, Any]) -> None:
-                done_result.update(res)
-
-            await _run_remote_grasp(str(task.get("prompt")), task, on_done=_collect)
-            last = done_result or last
+    """Execute each task from a new observation, stopping on any failed step."""
+    results = []
+    run = _run_context.get()
+    index = 0
+    last = {'success': False, 'stage': 'FAILED', 'message': '队列为空'}
+    for index, task in enumerate(tasks, 1):
+        if run is not None:
+            run.step_index, run.step_total = index, len(tasks)
+        if _cancelled():
+            last = {'success': False, 'stage': 'CANCELED', 'message': '已取消，后续步骤未执行'}
+            break
+        error = sequence_state_error([task], session.holding)
+        if error:
+            last = {'success': False, 'stage': 'FAILED', 'message': error}
+            break
+        await hub.update(step_index=index, step_total=len(tasks), parsed=task,
+                         robot_state='BUSY', busy=True, stage='ACCEPTED')
+        await hub.broadcast({'type': 'step', 'message': describe_task(task),
+                             'parsed': task, 'step_index': index, 'step_total': len(tasks)})
+        if (index > 1 and task['action'] in {'remote_grasp', 'remote_place'}
+                and not results[-1].get('at_observation_pose')):
+            # The wrist camera must see the updated scene after the previous
+            # release. This is a new planning observation, not a visual recheck.
+            await hub.update(stage='MOVE_READY')
+            await hub.broadcast({'type': 'info', 'message': '回到观察位，重新观察当前场景'})
+            try:
+                ready = await asyncio.get_running_loop().run_in_executor(
+                    None, _motion_if_active, run, _bridge().pose_ready)
+            except Exception as exc:
+                ready = {'success': False, 'message': str(exc)}
+            if not ready.get('success'):
+                last = {'success': False, 'stage': 'FAILED',
+                        'message': '返回观察位失败：'+str(ready.get('message') or '未知原因')}
+                break
+            if _cancelled():
+                last = {'success': False, 'stage': 'CANCELED', 'message': '已取消，未开始下一步规划'}
+                break
+        action = task['action']
+        if action == 'remote_grasp':
+            last = await _run_remote_grasp(str(task['prompt']), task)
+        elif action == 'remote_place':
+            last = await _run_remote_place(str(task['prompt']), task)
+        elif action == 'release':
+            last = await _run_release(task)
+        elif action in {'go_ready', 'go_home'}:
+            last = await _run_pose_move(action, task)
         else:
-            await _run_pick_place(
-                str(task.get("target_color") or ""),
-                task,
-                skip_return_home=not last_item,
-                reuse_frozen_box=index > 0,
-            )
-            last = hub.state.get("last_result") or last
-        if not bool((last or {}).get("success")):
-            await hub.update(queue_active=False)
-            await hub.broadcast(
-                {
-                    "type": "result",
-                    "success": False,
-                    "message": f"队列在第{index + 1}个任务失败，已停止",
-                    "stage": "FAILED",
-                    "stage_zh": STAGE_ZH["FAILED"],
-                    "parsed": parsed,
-                }
-            )
-            return
-    await hub.update(
-        robot_state="IDLE",
-        busy=False,
-        stage="SUCCESS",
-        last_result=last,
-        queue_active=False,
-    )
-    await hub.broadcast(
-        {
-            "type": "result",
-            "success": True,
-            "message": f"队列完成，共{len(tasks)}个任务",
-            "stage": "SUCCESS",
-            "stage_zh": STAGE_ZH["SUCCESS"],
-            "parsed": parsed,
-        }
-    )
+            last = await _run_pick_place(str(task.get('target_color') or ''), task,
+                                        skip_return_home=index < len(tasks), reuse_frozen_box=False)
+        results.append(last)
+        if not last.get('success'):
+            break
+        if action in {'remote_grasp', 'remote_place'} and not last.get('executed'):
+            # A second dependent placement cannot use the unchanged physical
+            # scene when the first step was only planned.
+            last = {**last, 'stage': 'DRY_RUN', 'message': f'仅规划第 {index} 步，后续步骤未执行'}
+            break
+        if action == 'remote_place' or (action == 'remote_grasp' and ' | place: ' in task['prompt']):
+            if last.get('holding') is not False:
+                last = {**last, 'success': False, 'stage': 'FAILED',
+                        'message': '放置后未确认夹爪已释放，后续步骤停止'}
+                results[-1] = last
+                break
+    else:
+        last = {'success': True, 'stage': 'SUCCESS', 'message': f'连续任务完成，共 {len(tasks)} 步'}
+    success = bool(last.get('success'))
+    stage = str(last.get('stage') or 'FAILED')
+    if not success:
+        last = {**last, 'message': f'第 {index} 步停止：{last.get("message", "未知原因")}'}
+    last = dict(last, steps_completed=sum(bool(item.get('success')) and item.get('executed', True)
+                                          for item in results), step_total=len(tasks))
+    await hub.update(robot_state='IDLE', busy=False, stage=stage, last_result=last, queue_active=False)
+    await hub.broadcast({'type': 'result', 'ok': success, 'success': success,
+                         'message': last['message'], 'stage': stage, 'stage_zh': STAGE_ZH.get(stage, stage),
+                         'parsed': parsed, 'sequence_summary': True,
+                         'duration_s': round(time.monotonic()-run.started, 2) if run else None})
 
 
 async def _run_pick_place(
@@ -1337,7 +1554,7 @@ async def _run_pick_place(
     on_done=None,
     skip_return_home: bool = False,
     reuse_frozen_box: bool = False,
-) -> None:
+) -> Dict[str, Any]:
     loop = asyncio.get_running_loop()
 
     def on_feedback(stage: str) -> None:
@@ -1384,11 +1601,14 @@ async def _run_pick_place(
         await on_done(
             {
                 "ok": success,
+                "success": success,
                 "message": result.get("message"),
                 "stage": stage,
                 "stage_zh": STAGE_ZH.get(stage, stage),
             }
         )
+
+    return result
 
 
 async def _handle_qq_event(event: Dict[str, Any]) -> None:
@@ -1545,6 +1765,9 @@ def ensure_self_signed_cert() -> tuple[Path, Path]:
 
 
 def main(args: Optional[List[str]] = None) -> None:
+    if args is None:
+        from rclpy.utilities import remove_ros_args
+        args = remove_ros_args()[1:]
     parser_cli = argparse.ArgumentParser(description="X5A phone voice web agent")
     parser_cli.add_argument("--host", default=os.environ.get("X5A_WEB_HOST", "0.0.0.0"))
     parser_cli.add_argument(
@@ -1578,30 +1801,22 @@ def main(args: Optional[List[str]] = None) -> None:
         os.environ["X5A_WEB_TERMINAL"] = "1"
 
     ip = local_ip()
-    print("========================================")
-    print(" X5A Voice Web Agent")
-    print("========================================")
-    print(f"page:   http://{ip}:{parsed.port}")
-    print(f"local:  http://127.0.0.1:{parsed.port}")
-    print(f"ASR:    {asr_backend.name} (local faster-whisper small)")
-    print(f"text->: {forward_url()}")
-    mqtt_host, mqtt_port, mqtt_topic = mqtt_host_port_topic()
-    print(
-        f"mqtt:   {mqtt_host}:{mqtt_port} {mqtt_topic} "
-        f"wait_start={int(wait_start_enabled())} timeout={mqtt_start_timeout():.0f}s"
-    )
-    print(f"dry_run:{os.environ.get('X5A_WEB_DRY_RUN', '0')}")
+    mode = '真机执行' if auto_execute_enabled() and not parsed.dry_run else '仅规划 / 演练'
+    print(f'\nSAM 腕部抓放 | {mode} | 语音：{asr_backend.name}', flush=True)
+    print(f'手机页面：http://{ip}:{parsed.port}  本机：http://127.0.0.1:{parsed.port}', flush=True)
+    if os.environ.get('X5A_TASK_LOG_DIR'):
+        print(f'详细日志：{os.environ["X5A_TASK_LOG_DIR"]}', flush=True)
+    if wait_start_enabled():
+        print(f'任务开始前等待数字人标志，超时 {mqtt_start_timeout():.0f}s', flush=True)
     if terminal_enabled():
-        print("terminal: on（在当前终端直接打字，等同语音转写；/help 看命令）")
+        print('文字和语音共用同一套任务流程；/help 查看示例', flush=True)
 
     import threading
     import uvicorn
 
     if not parsed.no_https:
         cert, key = ensure_self_signed_cert()
-        print(f"voice:  https://{ip}:{parsed.https_port}")
-        print("Voice needs HTTPS. On the phone, open the voice URL")
-        print("and accept the certificate warning.")
+        print(f'手机语音：https://{ip}:{parsed.https_port}（首次使用需接受本机证书）', flush=True)
 
         def _run_https() -> None:
             uvicorn.run(
@@ -1616,15 +1831,13 @@ def main(args: Optional[List[str]] = None) -> None:
 
         threading.Thread(target=_run_https, name="x5a-https", daemon=True).start()
 
-    print("This process does not publish /arm_cmd.")
-    print("========================================")
-
     uvicorn.run(
         app,
         host=parsed.host,
         port=parsed.port,
         ws="wsproto",
-        log_level="info",
+        log_level="warning",
+        access_log=False,
     )
 
 

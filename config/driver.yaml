@@ -1,0 +1,6 @@
+/**:
+  ros__parameters:
+    arm_can_id: can1
+    motor_feedback_timeout_ms: 300.0
+    # Preserve the original 800ms deadline for motor ids 5..8.
+    other_motor_feedback_timeout_ms: 800.0

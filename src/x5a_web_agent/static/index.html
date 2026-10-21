@@ -4,15 +4,15 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0b1220" />
-  <title>X5A 语音抓取</title>
+  <title>X5A 腕部抓放</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <main class="app">
     <header class="top">
       <div>
-        <p class="eyebrow">ARX X5A · Voice Pick & Place</p>
-        <h1>语音抓取</h1>
+        <p class="eyebrow">ARX X5A · Wrist Pick & Place</p>
+        <h1>腕部颜色抓放</h1>
       </div>
       <div id="linkBadge" class="badge idle">连接中</div>
     </header>
@@ -22,11 +22,12 @@
         <span class="label">机械臂状态</span>
         <span id="busyBadge" class="pill">空闲</span>
       </div>
-      <p id="stageText" class="stage">空闲，等待指令</p>
+      <p id="stageText" class="stage">先说“准备”，再说“抓红色”</p>
       <p id="stageCode" class="mono">IDLE</p>
       <div class="row">
-        <span class="label">手上</span>
-        <span id="holdingBadge" class="pill">空手</span>
+        <span class="label">观察位</span>
+        <span id="observationSideBadge" class="pill">当前侧</span>
+        <span id="holdingBadge" class="pill">尚未准备</span>
       </div>
       <p id="resultText" class="result"></p>
     </section>
@@ -54,21 +55,23 @@
 
     <form id="textForm" class="text-form">
       <input id="textInput" type="text" inputmode="text" autocomplete="off"
-             placeholder="也可以直接输入：抓红色" />
+             placeholder="抓白色方块／放到红色方块上／把白色方块放进盒子里" />
       <button type="submit">发送</button>
     </form>
 
     <section class="manual">
-      <span class="label">手动测试</span>
+      <span class="label">“抓白色”只抓起并等待；“放到红色上”放置；完整一句可直接抓放</span>
+      <p class="fineprint">也可以说“夹起橘色小方块”“按橙白红顺序放进盒子”“你拿着什么颜色”。</p>
       <div class="colors">
-        <button type="button" data-color="red" class="swatch red">红色</button>
-        <button type="button" data-color="white" class="swatch white">白色</button>
-        <button type="button" data-color="orange" class="swatch orange">橙色</button>
+        <button type="button" data-command="当前侧准备" class="swatch">当前侧准备</button>
+        <button type="button" data-command="镜像侧准备" class="swatch">镜像侧准备</button>
+        <button type="button" data-command="回原点" class="swatch">回零位</button>
+        <button type="button" data-command="松开夹爪" class="swatch">松开夹爪</button>
       </div>
       <div class="colors">
-        <button type="button" data-command="放下" class="swatch">放下</button>
-        <button type="button" data-command="归位" class="swatch">归位</button>
-        <button type="button" data-command="就位" class="swatch">就位</button>
+        <button type="button" data-command="看到了哪些方块" class="swatch">识别情况</button>
+        <button type="button" data-command="你拿着什么颜色" class="swatch">持物颜色</button>
+        <button type="button" data-command="帮助" class="swatch">语音示例</button>
       </div>
       <button id="stopBtn" type="button" class="stop">停止当前任务</button>
       <p class="fineprint">停止按钮只取消任务层，不会代替机械臂底层急停。</p>

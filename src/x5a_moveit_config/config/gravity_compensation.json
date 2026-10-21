@@ -1,0 +1,13 @@
+{
+  "gravity_trim_mass_kg": 0.125,
+  "status": "trial_125g_pending_controller_reload_and_hardware_verification",
+  "validated_date": "2026-10-06",
+  "validation_feedback": "User reports gravity compensation is normal with the 75g trim and requests keeping this parameter; no validation across all poses claimed",
+  "physical_camera_payload_kg": 0.225,
+  "reason": "User explicitly requests another small increase after the 100g trim; add 25g, physical payload remains 225g",
+  "previous_gravity_trim_mass_kg": 0.1,
+  "previous_trial_feedback": "Controller was restarted at 20:13:34 on 2026-10-08 after the 100g model update; user requests a further increase, no quantitative validation recorded",
+  "scope": "vendor x5.urdf only; keep physical MoveIt payload mass unchanged",
+  "rollback": "Restore gravity_trim_mass_kg=0.1, run sync_camera_payload.py and reload existing controller with the arm fully supported",
+  "vendor_reference": "https://github.com/ARXroboticsX/X5/blob/master/readme.md"
+}

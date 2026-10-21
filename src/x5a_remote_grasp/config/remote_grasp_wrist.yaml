@@ -1,0 +1,199 @@
+# Wrist camera: use only after calibrated TF is validated. Camera box dimensions/center remain estimates; measure before execution.
+/**:
+  ros__parameters:
+    remote:
+      base_url: http://118.253.179.80:8300
+      api_key_env: SAM_GRASPNET_API_KEY
+      connect_timeout_s: 3.0
+      inference_timeout_s: 120.0
+      threshold: 0.45
+      mask_dilation_px: 2
+      num_point: 20000
+      top_k_default: 20
+      top_k_max: 40
+      collision_thresh: 0.01
+      voxel_size: 0.005
+      target_distance_thresh: 0.006
+    topics:
+      color: /wrist_camera/color/image_raw
+      aligned_depth: /wrist_camera/depth/image_raw
+      camera_info: /wrist_camera/color/camera_info
+    sync:
+      queue_size: 10
+      slop_s: 0.06
+      max_stamp_delta_s: 0.08
+      max_frame_age_s: 1.0
+    depth:
+      camera_node: /wrist_camera/wrist_camera
+      units_parameter: depth_module.depth_units
+      scale_m_per_unit_override: 0.001
+      allow_32fc1_reencode: false
+      min_m_default: 0.1
+      max_m_default: 1.5
+    frames:
+      base: base_link
+      tf_timeout_s: 0.5
+      max_tf_stamp_delta_s: 0.1
+    workspace:
+      x_min: 0.08
+      x_max: 0.41
+      y_min: 0.08
+      y_max: 0.48
+      z_min: -0.005
+      z_max: 0.5
+      r_max: 0.54
+      table_clearance_m: 0.005
+    gripper:
+      max_width_m: 0.088
+      width_margin_m: 0.006
+      width_to_finger_ratio: 0.5
+      joint_names:
+      - joint7
+      - joint8
+    grasp:
+      approach_axis: x
+      pregrasp_distance_m: 0.05
+      lift_distance_m: 0.08
+      retreat_distance_m: 0.08
+      max_pregrasp_z: 0.11
+      orientation_mode: graspnet
+      template_rpy:
+      - 0.0
+      - 1.45
+      - 0.0
+      tcp_backoff_m: 0.015
+      template_pregrasp_distance_m: 0.04
+      min_tool0_height_m: 0.02
+      transit_pitches:
+      - 1.15
+      - 0.9
+      place_pitches:
+      - 1.45
+      - 1.15
+      - 0.9
+      - 0.75
+      place_release_clearances_m:
+      - 0.01
+      - 0.015
+      - 0.018
+      - 0.02
+      approach_offset_m: 0.0
+      max_approach_z: 0.35
+      allow_reachable_fallback: true
+      pitch_ladder:
+      - 1.45
+      - 1.15
+      - 0.9
+      - 0.75
+      yaw_ladder_deg:
+      - 0
+      - 45
+      - -45
+      - 180
+      min_score: 0.15
+      template_fallback: true
+      place_offset_search_m: 0.03
+      place_offset_step_m: 0.015
+      place_offset_max_points: 9
+      transform_grasp_tool_translation:
+      - -0.015
+      - 0.0
+      - 0.0
+      transform_grasp_tool_rotation:
+      - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+      tip_offset_m: 0.015
+      finger_length_m: 0.1
+      finger_thickness_m: 0.01
+      finger_height_m: 0.02
+      pad_length_m: 0.03
+      native_budget_fraction: 0.45
+      max_target_motion_m: 0.01
+      max_capture_to_execute_s: 60.0
+      center_band_enabled: false
+    poses:
+      ready_joints:
+      - 0.72
+      - 0.85
+      - 0.95
+      - -0.55
+      - 0.0
+      - 0.0
+      hold_joints:
+      - 0.72
+      - 0.85
+      - 0.95
+      - -0.55
+      - 0.0
+      - 0.0
+    interaction:
+      carry_to_ready: true
+    safety:
+      plan_only: true
+      tcp_mapping_confirmed: true
+      require_table_collision: true
+      require_camera_collision: true
+    planning:
+      enabled: true
+      group: arm
+      tcp_frame: tool0
+      move_group_action: /move_action
+      compute_ik_service: /compute_ik
+      state_validity_service: /check_state_validity
+      apply_scene_service: /apply_planning_scene
+      allowed_time_s: 5.0
+      result_timeout_s: 30.0
+      ik_timeout_s: 0.15
+      attempts: 4
+      velocity_scaling: 0.1
+      acceleration_scaling: 0.1
+      position_tolerance_m: 0.003
+      orientation_tolerance_rad: 0.05
+      cartesian_step: 0.003
+      min_cartesian_fraction: 0.9999
+      total_budget_s: 30.0
+      geometry_workers: 2
+      parallel_ik_service: /x5a_parallel_ik/solve
+      parallel_ik_workers: 4
+      parallel_ik_fallback_serial: true
+      reachability_table: /home/quella/.local/share/x5a_remote_grasp/reachability.json
+    scene:
+      table_center:
+      - 0.25
+      - 0.3
+      - -0.026
+      table_size:
+      - 0.52
+      - 0.72
+      - 0.04
+      camera_size:
+      - 0.1
+      - 0.05
+      - 0.05
+      camera_center_in_camera_link:
+      - 0.0
+      - 0.0
+      - 0.0
+      camera_frame: wrist_camera_link
+      camera_mount: eye_in_hand
+      camera_mount_link: tool0
+      camera_touch_links:
+      - link6
+      - tool0
+    markers:
+      topic: /x5a_remote_grasp/candidates
+      axis_length_m: 0.06
+      axis_diameter_m: 0.006
+      lifetime_s: 60.0
+    capture:
+      directory: /home/quella/.local/share/x5a_remote_grasp/captures
+    action_name: /x5a_remote_grasp/plan
+    health_service: /x5a_remote_grasp/health
+    save_snapshot_service: /x5a_remote_grasp/save_snapshot

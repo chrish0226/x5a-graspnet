@@ -151,16 +151,25 @@ def test_place_collision_checks_use_closed_fingers_after_grasp():
 
 
 @pytest.mark.parametrize('workers', [1, 2])
-def test_second_native_candidate_precedes_geometric_reorientation(workers):
+def test_second_native_candidate_precedes_geometric_reorientation(workers, monkeypatch):
     import numpy as np
     from x5a_remote_grasp.geometry import RemoteGrasp
     from x5a_remote_grasp.grasp_quality import GripperGeometry
     from x5a_remote_grasp.remote_grasp_node import RemoteGraspNode
+    import x5a_remote_grasp.remote_grasp_node as node_module
     from test_grasp_quality import contact_cloud
     calls = []
+    checked = []
+    assess = node_module.assess_tool_grasp
+    def measured(*args):
+        checked.append(True)
+        return assess(*args)
+    monkeypatch.setattr(node_module, 'assess_tool_grasp', measured)
     plan = NS(stages=['PREGRASP', 'GRASP', 'LIFT', 'RETREAT'])
     def sequence(poses):
         calls.append(poses[1][1][:3, 3].copy())
+        if workers == 1:
+            assert len(checked) == len(calls)  # plan before evaluating later candidates
         return (None, 'first native branch unavailable') if len(calls) == 1 else (plan, '')
     p = NS(ready=lambda: (True, ''), apply_scene=lambda _: (True, ''),
            plan_sequence=sequence, last_solution_seed=None)
@@ -169,7 +178,7 @@ def test_second_native_candidate_precedes_geometric_reorientation(workers):
     mapping[0, 3] = -0.015
     fake = NS(target_cloud=target, scene_cloud=target, planner=p, planning_enabled=True,
         geometry_workers=workers,
-        _safety_scene=lambda _: None, plan_budget_s=30.0, native_budget_fraction=0.45,
+        _apply_safety_scene=lambda _: (True, ''), plan_budget_s=30.0, native_budget_fraction=0.45,
         min_score=0.15, max_approach_z=0.35, allow_reachable_fallback=True,
         template_fallback=True, orientation_mode='graspnet', gripper_geometry=GripperGeometry(),
         _orientation_variants=lambda t: [(t[:3, :3], t[:3, :3], 'graspnet')],
@@ -182,7 +191,7 @@ def test_second_native_candidate_precedes_geometric_reorientation(workers):
         _ik_joint_seeds=lambda *_: [], _pose_stamped=lambda matrix, _: matrix,
         _record_reject=lambda *_: None, _feedback=lambda *_: None)
     transforms, grasps = [], []
-    for index, x in enumerate([0.2, 0.21]):
+    for index, x in enumerate([0.2, 0.21, 0.205]):
         transform = np.eye(4)
         transform[:3, 3] = [x, 0.3, 0.02]
         transforms.append(transform)
@@ -192,3 +201,32 @@ def test_second_native_candidate_precedes_geometric_reorientation(workers):
     assert len(calls) == 2
     assert chosen[0].index == 1 and chosen[0].score == pytest.approx(0.8)
     assert fake.selection_kind == 'native'
+
+
+def test_pregrasp_and_approach_use_open_jaws_before_planned_close():
+    p=planner();starts={}
+    def stage(name,pose,start,*_):
+        starts[name]=start
+        return trajectory(),start,''
+    p._plan_stage=stage;p.verify_endpoint=lambda *_:(True,'')
+    p.expected_pregrasp_open_position=.044;p.expected_grasp_finger_position=.014
+    result,reason=p.plan_sequence([(name,PoseStamped()) for name in ['PREGRASP','GRASP','LIFT']])
+    assert result is not None,reason
+    for name in ['PREGRASP','GRASP']:
+        values=dict(zip(starts[name].joint_state.name,starts[name].joint_state.position))
+        assert values['joint7']==values['joint8']==.044
+    values=dict(zip(starts['LIFT'].joint_state.name,starts['LIFT'].joint_state.position))
+    assert values['joint7']==values['joint8']==.014
+
+
+def test_serial_ik_fallback_seeds_keep_the_planned_opening():
+    p=planner();p.parallel_ik=None;seen=[]
+    seed=RobotState(is_diff=True);seed.joint_state.name=['joint7','joint8'];seed.joint_state.position=[.044,.044]
+    def attempt(pose,state):
+        seen.append(state);return None,'no solution'
+    p._collision_aware_ik_once=attempt
+    p.collision_aware_ik(PoseStamped(),seed,extra_joint_seeds=[[0.]*6,[.1]*6])
+    assert len(seen)>=3
+    for state in seen:
+        values=dict(zip(state.joint_state.name,state.joint_state.position))
+        assert values['joint7']==values['joint8']==.044

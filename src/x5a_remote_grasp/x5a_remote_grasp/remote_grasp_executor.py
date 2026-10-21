@@ -46,18 +46,22 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from control_msgs.action import FollowJointTrajectory, GripperCommand
-from moveit_msgs.msg import DisplayTrajectory
+from moveit_msgs.msg import DisplayTrajectory, PlanningScene, CollisionObject
+from geometry_msgs.msg import Pose
+from shape_msgs.msg import SolidPrimitive
 from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger
+from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 from rclpy.time import Time
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from x5a_remote_grasp.moveit_plan import DISPLAY_MODEL_ID
+from x5a_remote_grasp.moveit_plan import DISPLAY_MODEL_ID, PlanOnlyMoveIt
 from x5a_remote_grasp.grasp_quality import held_from_gap, trajectory_fingerprint
 
 # 段名由规划器的 poses 列表决定：抓取=4、抓取+放置=6、纯放置=3。
 STAGE_TABLE = {
+    1: ("OBSERVE",),
     3: ("TRANSPORT", "PLACE", "RETREAT"),
     4: ("PREGRASP", "GRASP", "LIFT", "RETREAT"),
     6: ("PREGRASP", "GRASP", "LIFT", "TRANSPORT", "PLACE", "RETREAT"),
@@ -94,7 +98,21 @@ class RemoteGraspExecutor(Node):
     def __init__(self) -> None:
         super().__init__("x5a_remote_grasp_executor")
         self.declare_parameter("execution.enabled", False)
+        # Trusted idle service reloads may restore a previously confirmed empty hand.
+        self.declare_parameter("execution.initial_empty", False)
+        self.declare_parameter('execution.plan_joint_moves', False)
+        self.declare_parameter('frames.base', 'base_link')
+        self.declare_parameter('planning.tcp_frame', 'tool0')
+        self.declare_parameter('planning.move_group_action', '/move_action')
+        self.declare_parameter('planning.compute_ik_service', '/compute_ik')
+        self.declare_parameter('planning.state_validity_service', '/check_state_validity')
+        self.declare_parameter('planning.apply_scene_service', '/apply_planning_scene')
+        self.declare_parameter('planning.velocity_scaling', 0.1)
+        self.declare_parameter('planning.acceleration_scaling', 0.1)
+        self.declare_parameter('scene.table_center', [0.25, 0.30, -0.026])
+        self.declare_parameter('scene.table_size', [0.52, 0.72, 0.04])
         self.declare_parameter("execution.plan_max_age_s", 30.0)
+        self.declare_parameter('execution.enforce_tcp_tolerance', True)
         self.declare_parameter('execution.grasp_position_tolerance_m', 0.007)
         self.declare_parameter('execution.grasp_angle_tolerance_rad', 0.12)
         self.declare_parameter('execution.place_position_tolerance_m', 0.003)
@@ -107,12 +125,21 @@ class RemoteGraspExecutor(Node):
         # 与 x5a_pick_place 一致：开=0.044，合=0.0（靠堵转夹住物体）。
         self.declare_parameter("gripper.position_ratio", 1.0)
         self.declare_parameter("gripper.max_position_m", 0.044)
+        self.declare_parameter('gripper.model_path', '')
         self.declare_parameter("poses.ready_joints", [0.72, 0.85, 0.95, -0.55, 0.0, 0.0])
         self.declare_parameter("controllers.arm_fjt", "/x5a_arm_controller/follow_joint_trajectory")
         self.declare_parameter("controllers.gripper", "/x5a_gripper_controller/gripper_cmd")
         self.declare_parameter("topics.display_path", "/display_planned_path")
         self.enabled = bool(self.get_parameter("execution.enabled").value)
+        self.base_frame = str(self.get_parameter('frames.base').value)
+        self.tcp_frame = str(self.get_parameter('planning.tcp_frame').value)
+        self.plan_joint_moves = bool(self.get_parameter('execution.plan_joint_moves').value)
+        self.velocity_scaling = float(self.get_parameter('planning.velocity_scaling').value)
+        self.acceleration_scaling = float(self.get_parameter('planning.acceleration_scaling').value)
+        self.table_center = list(self.get_parameter('scene.table_center').value)
+        self.table_size = list(self.get_parameter('scene.table_size').value)
         self.plan_max_age = float(self.get_parameter("execution.plan_max_age_s").value)
+        self.enforce_tcp_tolerance = bool(self.get_parameter('execution.enforce_tcp_tolerance').value)
         self.grasp_position_tolerance = float(self.get_parameter('execution.grasp_position_tolerance_m').value)
         self.grasp_angle_tolerance = float(self.get_parameter('execution.grasp_angle_tolerance_rad').value)
         self.place_position_tolerance = float(self.get_parameter('execution.place_position_tolerance_m').value)
@@ -125,27 +152,52 @@ class RemoteGraspExecutor(Node):
         # 不是总开口宽度——换算比例 1.0，超限会被 adapter 拒绝。
         self.gripper_ratio = float(self.get_parameter("gripper.position_ratio").value)
         self.gripper_max_pos = float(self.get_parameter("gripper.max_position_m").value)
+        model_path = str(self.get_parameter('gripper.model_path').value)
+        self.gripper_model = None
+        if model_path:
+            from x5a_remote_grasp.gripper_model import GripperModel
+            from pathlib import Path
+            model = GripperModel.load(model_path)
+            self.gripper_model = model
+            model.validate_sources(Path(model_path).resolve().parents[1])
+            if (not np.isclose(self.open_width, model.max_width/2)
+                    or not np.isclose(self.gripper_max_pos, model.max_width/2)):
+                raise ValueError('executor jaw opening conflicts with shared gripper model')
         self.ready_joints = [float(v) for v in self.get_parameter("poses.ready_joints").value]
         fjt_name = str(self.get_parameter("controllers.arm_fjt").value)
         gripper_name = str(self.get_parameter("controllers.gripper").value)
         display_topic = str(self.get_parameter("topics.display_path").value)
 
         cb = ReentrantCallbackGroup()
+        self.pose_planner = None
+        if self.plan_joint_moves:
+            self.pose_planner = PlanOnlyMoveIt(
+                self, cb, group_name='arm', tcp_frame=self.tcp_frame,
+                move_action=str(self.get_parameter('planning.move_group_action').value),
+                ik_service=str(self.get_parameter('planning.compute_ik_service').value),
+                validity_service=str(self.get_parameter('planning.state_validity_service').value),
+                apply_scene_service=str(self.get_parameter('planning.apply_scene_service').value),
+                allowed_time=5.0, result_timeout=30.0, ik_timeout=0.15, attempts=4,
+                velocity_scaling=self.velocity_scaling, acceleration_scaling=self.acceleration_scaling,
+                position_tolerance=0.003, orientation_tolerance=0.05)
         self.latest_plan = None
         self.latest_plan_time = 0.0
         self.latest_joints = None
         self.joints_monotonic = 0.0
-        self.holding_state = 'unknown'
+        self.holding_state = 'empty' if self.get_parameter('execution.initial_empty').value else 'unknown'
         self.validated_tool = None
         self.validated_place_tool = None
         self.held_geometry = None
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.running = False
+        self._cancel_event = threading.Event()
         # 夹爪里是否有物体：抓取计划合爪后置位，放置/放下后清零。
         # agent 的会话状态以此为准（重启 agent 后可用 executor_state 重新对齐）。
         self.holding = False
         self._done = threading.Event()
+        self.create_service(Trigger, '/x5a_remote_grasp/cancel', self._on_cancel,
+                            callback_group=cb)
         self._outcome: Dict[str, object] = {}
         plan_qos = QoSProfile(
             depth=1,
@@ -158,6 +210,7 @@ class RemoteGraspExecutor(Node):
         self.fjt_client = ActionClient(self, FollowJointTrajectory, fjt_name)
         self.gripper_client = ActionClient(self, GripperCommand, gripper_name)
         self.validation_client = self.create_client(Trigger, '/x5a_remote_grasp/validate_latest', callback_group=cb)
+        self.stage_publisher = self.create_publisher(String, '/x5a_remote_grasp/execution_stage', 10)
         self.execute_srv = self.create_service(
             Trigger, "/x5a_remote_grasp/execute", self._on_execute, callback_group=cb
         )
@@ -252,7 +305,7 @@ class RemoteGraspExecutor(Node):
         target = np.asarray(expected)
         deadline = time.monotonic()+1.0
         while True:
-            actual = self.tf_buffer.lookup_transform('base_link', 'tool0', Time())
+            actual = self.tf_buffer.lookup_transform(self.base_frame, self.tcp_frame, Time())
             stamp = actual.header.stamp
             age = (self.get_clock().now().nanoseconds/1e9)-(stamp.sec+stamp.nanosec/1e9)
             if not -0.1 <= age <= 0.5:
@@ -262,6 +315,13 @@ class RemoteGraspExecutor(Node):
             position = float(np.linalg.norm(matrix[:3, 3]-target[:3, 3]))
             angle = float(np.arccos(np.clip((np.trace(matrix[:3, :3].T@target[:3, :3])-1)/2, -1, 1)))
             if position <= position_tolerance and angle <= angle_tolerance:
+                return matrix
+            if not getattr(self, 'enforce_tcp_tolerance', True):
+                action = '松爪' if label == '放置' else '合爪'
+                self.get_logger().warn(
+                    f'实际{label}点偏差 {position*1000:.1f}mm/{np.degrees(angle):.1f}度；'
+                    f'TCP 精度拦截已关闭，继续{action}'
+                )
                 return matrix
             if time.monotonic() >= deadline:
                 action = '松爪' if label == '放置' else '合爪'
@@ -280,6 +340,7 @@ class RemoteGraspExecutor(Node):
     def _block_until_done(self, worker: threading.Thread, timeout: float, response):
         """阻塞到 worker 线程结束，把真实结果写回服务响应。"""
         self._done.clear()
+        self._cancel_event.clear()
         self._outcome = {
             "ok": False, "stage": "FAILED", "message": "未开始", "holding": self.holding
         }
@@ -299,6 +360,14 @@ class RemoteGraspExecutor(Node):
         return response
 
     # ---------- services ----------
+    def _on_cancel(self, request, response):
+        # Match wrist stop semantics: finish the current controller action,
+        # then prevent every later arm/gripper goal, including release.
+        self._cancel_event.set()
+        response.success = True
+        response.message = '已请求停止；当前动作结束后不再继续后续步骤'
+        return response
+
     @guarded_service
     def _on_execute(self, request, response):
         if not self.enabled:
@@ -346,7 +415,7 @@ class RemoteGraspExecutor(Node):
         timeout = self.traj_timeout * max(1, len(stages)) + 30.0
         plan = self.latest_plan
         # Run preflight inside the worker (running is set first), so another
-        # execute/release cannot interleave with the perception check.
+        # execute/release cannot interleave with the plan metadata check.
         return self._block_until_done(
             threading.Thread(target=self._run, args=(plan, stages), daemon=True),
             timeout,
@@ -368,6 +437,7 @@ class RemoteGraspExecutor(Node):
                 "stage": "BUSY", "message": "执行器忙碌", "holding": self.holding,
             })
             return response
+        self._cancel_event.clear()  # an explicit new release after a stopped task
         ok = self._gripper(self.open_width, 3.0)
         if ok:
             self.holding = False
@@ -384,12 +454,11 @@ class RemoteGraspExecutor(Node):
 
     @guarded_service
     def _on_go_home(self, request, response):
-        """恢复 Home（全零关节位）。直线关节插值、低速——不走 MoveIt。
-        手里有物体时也照常执行（用户选择），但不动夹爪、会打 warning。"""
+        """Return home; wrist mode plans through MoveIt, without opening fingers."""
         if self.holding:
             self.get_logger().warn("going home while the gripper is still holding an object")
         return self._start_joint_move(
-            [0.0] * 6, "HOME", "开始返回 Home（约 5 秒，低速直线插值到全零关节位）",
+            [0.0] * 6, "HOME", "开始返回全零关节位",
             "HOME SUCCESS: 已回到全零关节位", response,
         )
 
@@ -399,7 +468,7 @@ class RemoteGraspExecutor(Node):
         if self.holding:
             self.get_logger().warn("going to ready pose while still holding an object")
         return self._start_joint_move(
-            list(self.ready_joints), "READY", "开始到预抓取就绪姿态（约 5 秒，低速关节插值）",
+            list(self.ready_joints), "READY", "开始到预抓取观察位",
             "READY SUCCESS: 已到预抓取就绪姿态", response,
         )
 
@@ -423,6 +492,11 @@ class RemoteGraspExecutor(Node):
 
     def _start_joint_move(self, target: List[float], label: str, start_msg: str,
                           ok_msg: str, response):
+        if not self.enabled:
+            response.success = False
+            response.message = self._json({'stage': 'FAILED', 'message': '执行未启用',
+                                           'holding': self.holding})
+            return response
         if self.running:
             response.success = False
             response.message = self._json({
@@ -436,6 +510,11 @@ class RemoteGraspExecutor(Node):
                 "holding": self.holding,
             })
             return response
+        if time.monotonic()-self.joints_monotonic > 0.5:
+            response.success = False
+            response.message = self._json({'stage': 'FAILED', 'message': '关节反馈已过期',
+                                           'holding': self.holding})
+            return response
         arm_names = [f"joint{i}" for i in range(1, 7)]
         index = {n: i for i, n in enumerate(self.latest_joints[0])}
         if not all(n in index for n in arm_names):
@@ -446,6 +525,10 @@ class RemoteGraspExecutor(Node):
             })
             return response
         current = [self.latest_joints[1][index[n]] for n in arm_names]
+        if self.plan_joint_moves:
+            worker = threading.Thread(target=self._run_planned_joints,
+                args=(target, label, ok_msg), daemon=True)
+            return self._block_until_done(worker, 75.0, response)
         trajectory = JointTrajectory()
         trajectory.joint_names = arm_names
         steps = 20
@@ -461,6 +544,50 @@ class RemoteGraspExecutor(Node):
             target=self._run_joints, args=(trajectory, label, start_msg, ok_msg), daemon=True
         )
         return self._block_until_done(worker, 30.0, response)
+
+    def _pose_scene(self):
+        # Ready can be the first request, before the grasp planner adds a table.
+        scene = PlanningScene(is_diff=True)
+        scene.robot_state.is_diff = True  # preserve any existing attachments
+        table = CollisionObject(id='remote_grasp_table')
+        table.header.frame_id = self.base_frame
+        table.operation = CollisionObject.ADD
+        table.primitives = [SolidPrimitive(type=SolidPrimitive.BOX, dimensions=self.table_size)]
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = self.table_center
+        pose.orientation.w = 1.0
+        table.primitive_poses = [pose]
+        scene.world.collision_objects = [table]
+        return scene
+
+    def _run_planned_joints(self, target, label, ok_msg):
+        """Ready/home use the calibrated MoveIt scene and retain attachments."""
+        outcome = {'ok': False, 'stage': 'FAILED', 'message': ''}
+        try:
+            if self.count_publishers('/arm_cmd') != 1:
+                raise RuntimeError('控制指令来源异常，未发送轨迹')
+            if time.monotonic()-self.joints_monotonic > 0.5:
+                raise RuntimeError('关节反馈已过期')
+            applied, reason = self.pose_planner.apply_scene(self._pose_scene())
+            if not applied:
+                raise RuntimeError(reason)
+            result, reason = self.pose_planner.plan_joints(
+                self.pose_planner.joints_to_state(target), None,
+                self.velocity_scaling, self.acceleration_scaling)
+            if result is None:
+                raise RuntimeError(reason)
+            ok, code = self._follow(result.planned_trajectory.joint_trajectory)
+            if not ok:
+                raise RuntimeError(f'{label} 轨迹执行失败 ({code})')
+            outcome.update(ok=True, stage='SUCCESS', message=ok_msg)
+        except Exception as exc:
+            outcome['message'] = str(exc)
+            self.get_logger().error(f'{label} FAILED: {exc}')
+        finally:
+            outcome['holding'] = self.holding
+            self._outcome = outcome
+            self.running = False
+            self._done.set()
 
     def _run_joints(self, trajectory, label: str, start_msg: str, ok_msg: str) -> None:
         outcome: Dict[str, object] = {"ok": False, "stage": "FAILED", "message": ""}
@@ -483,17 +610,22 @@ class RemoteGraspExecutor(Node):
             self._done.set()
 
     # ---------- plan execution ----------
+    def _publish_execution_stage(self, stage):
+        publisher = getattr(self, 'stage_publisher', None)
+        if publisher is not None:
+            publisher.publish(String(data='EXEC_'+stage))
+
     def _run(self, plan: DisplayTrajectory, stages: List[str]) -> None:
         outcome: Dict[str, object] = {"ok": False, "stage": "FAILED", "message": ""}
         try:
             if not self.validation_client.wait_for_service(timeout_sec=2.0):
-                raise RuntimeError('执行前感知复核服务未就绪')
+                raise RuntimeError('规划信息服务未就绪')
             future = self.validation_client.call_async(Trigger.Request())
             if not self._wait_future(future, 35.0):
-                raise RuntimeError('执行前目标复核超时')
+                raise RuntimeError('读取规划信息超时')
             validation = future.result()
             if validation is None or not validation.success:
-                raise RuntimeError('执行前复核失败: '+('无响应' if validation is None else validation.message))
+                raise RuntimeError('规划信息检查失败: '+('无响应' if validation is None else validation.message))
             checked = json.loads(validation.message)
             if checked.get('plan_fingerprint') != trajectory_fingerprint(plan.trajectory):
                 raise RuntimeError('规划已经更换，请重新执行最新规划')
@@ -508,21 +640,28 @@ class RemoteGraspExecutor(Node):
                 object_in_tool(checked.get('object_cloud_base'), self.validated_tool)
                 if self.holding:
                     raise RuntimeError('仍在持物，拒绝执行新的抓取计划')
+                RemoteGraspExecutor._publish_execution_stage(self, 'OPEN_GRIPPER')
                 if not self._gripper(self.open_width, 2.0):
                     raise RuntimeError("打开夹爪失败")
                 self.holding = False
                 self.holding_state = 'empty'
                 self.held_geometry = None
+            elif stages == ['OBSERVE']:
+                if checked.get('purpose') != 'observe' or self.holding:
+                    raise RuntimeError('观察轨迹的用途或空手状态不符')
             elif not self.holding:
                 raise RuntimeError('未确认持物，拒绝执行纯放置')
             for index, trajectory in enumerate(plan.trajectory):
                 stage = stages[index]
+                RemoteGraspExecutor._publish_execution_stage(self, stage)
                 self.get_logger().info(f"executing {stage} ({index + 1}/{len(stages)})")
                 ok, code = self._follow(trajectory.joint_trajectory)
                 if not ok:
                     raise RuntimeError(f"{stage} 段轨迹执行失败 (错误码 {code})")
                 if stage == "GRASP":
                     actual_grasp = self._verify_grasp_pose()
+                    self._verify_contact_geometry(checked, actual_grasp)
+                    RemoteGraspExecutor._publish_execution_stage(self, 'CLOSE_GRIPPER')
                     if not self._gripper(self.close_width, 3.0):
                         raise RuntimeError("闭合夹爪失败")
                     self.holding_state = self._holding_observation()
@@ -530,7 +669,7 @@ class RemoteGraspExecutor(Node):
                     if self.holding_state != 'held':
                         raise RuntimeError('夹爪闭合后未确认持物: '+self.holding_state)
                     self.held_geometry = {
-                        'cloud_tool': object_in_tool(checked['object_cloud_base'], actual_grasp).tolist(),
+                        'cloud_tool': object_in_tool(checked.get('attachment_cloud_base') or checked['object_cloud_base'], actual_grasp).tolist(),
                         'grasp_rotation': actual_grasp[:3, :3].tolist(),
                         'grasp_fingerprint': checked['plan_fingerprint'],
                     }
@@ -542,14 +681,18 @@ class RemoteGraspExecutor(Node):
                         raise RuntimeError('提起后未确认持物，可能滑落: '+self.holding_state)
                 if stage == "PLACE":
                     self._verify_place_pose()
+                    RemoteGraspExecutor._publish_execution_stage(self, 'RELEASE')
                     if not self._gripper(self.open_width, 3.0):
                         raise RuntimeError("放置后张开夹爪失败")
                     self.holding = False
                     self.holding_state = 'empty'
                     self.held_geometry = None
-                    self.get_logger().info("release TCP verified, gripper opened; placement not visually confirmed")
+                    precision = ('release TCP verified' if getattr(self, 'enforce_tcp_tolerance', True)
+                                 else 'controller trajectory completed; TCP deviation is advisory')
+                    self.get_logger().info(precision+", gripper opened; placement not visually confirmed")
             placed = "PLACE" in stages
-            message = "放置轨迹执行完成，夹爪已松开" if placed else "抓取完成，物体保持夹持"
+            message = ("已到观察位，请重新拍摄规划" if stages == ["OBSERVE"] else
+                       "放置轨迹执行完成，夹爪已松开" if placed else "抓取完成，物体保持夹持")
             outcome.update(ok=True, stage="SUCCESS", message=message)
             self.get_logger().info(f"EXECUTION SUCCESS: {message}")
         except Exception as exc:
@@ -562,6 +705,32 @@ class RemoteGraspExecutor(Node):
             self.running = False
             self._done.set()
 
+    def _verify_contact_geometry(self, checked, actual):
+        """Recheck actual TCP contact against the last validated pre-move cloud.
+
+        The wrist is too close for reliable depth at GRASP. This deliberately
+        reuses the validated static target instead of accepting close-range ghosts.
+        """
+        model = getattr(self, 'gripper_model', None)
+        if model is None:
+            return
+        if checked.get('geometry_model_id') != model.model_id:
+            raise RuntimeError('执行器与规划器夹爪模型不一致，未合爪')
+        assessment = model.contact_quality(np.asarray(checked['object_cloud_base']), actual)
+        directory = checked.get('capture_directory')
+        if directory:
+            from pathlib import Path
+            path = Path(directory).resolve()
+            base = Path('/home/quella/.local/share/x5a_remote_grasp/wrist_captures').resolve()
+            if path.is_relative_to(base):
+                try:
+                    (path/'actual_contact_check.json').write_text(json.dumps(
+                        dict(tool0=actual.tolist(), assessment=assessment), indent=2)+'\n')
+                except OSError:
+                    pass
+        if not assessment['valid']:
+            raise RuntimeError('实际 TCP 不具备可靠夹持接触，未合爪: '+assessment['reason'])
+
     def _wait_future(self, future, timeout: float) -> bool:
         """Block the worker thread on a future served by the main executor."""
         done = threading.Event()
@@ -570,8 +739,12 @@ class RemoteGraspExecutor(Node):
 
     def _follow(self, joint_trajectory) -> Tuple[bool, int]:
         """执行一段轨迹；任何跟踪失败都不是有效触底信号。"""
+        if self._cancel_event.is_set():
+            return False, -1
         if not self.fjt_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error("FollowJointTrajectory 服务未就绪")
+            return False, -1
+        if self._cancel_event.is_set():
             return False, -1
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = joint_trajectory
@@ -595,8 +768,12 @@ class RemoteGraspExecutor(Node):
         return True, 0
 
     def _gripper(self, width: float, timeout: float) -> bool:
+        if self._cancel_event.is_set():
+            return False
         if not self.gripper_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error("GripperCommand 服务未就绪")
+            return False
+        if self._cancel_event.is_set():
             return False
         goal = GripperCommand.Goal()
         goal.command.position = min(

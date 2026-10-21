@@ -15,7 +15,13 @@
   <depend>control_msgs</depend>
   <depend>moveit_msgs</depend>
   <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>action_msgs</depend>
   <depend>x5a_handeye</depend>
+  <exec_depend>moveit_configs_utils</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>x5a_remote_grasp</exec_depend>
   <export>
     <build_type>ament_python</build_type>
   </export>

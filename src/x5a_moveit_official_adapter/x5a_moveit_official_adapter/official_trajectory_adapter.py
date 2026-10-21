@@ -7,6 +7,7 @@ Hardware-facing topics are strictly the vendor interfaces:
 """
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
@@ -20,6 +21,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
+from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 from arx5_arm_msg.msg import RobotCmd, RobotStatus
@@ -57,6 +59,8 @@ class OfficialTrajectoryAdapter(Node):
         self.last_state_jump_time = time.monotonic()
         self.state_fault = ""
         self.goal_active = False
+        self.driver_health = None
+        self.driver_health_time = 0.0
 
         latest_reliable = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -75,6 +79,12 @@ class OfficialTrajectoryAdapter(Node):
         )
         self.cmd_pub = self.create_publisher(
             RobotCmd, self.command_topic, latest_reliable
+        )
+        self.create_subscription(
+            String, '/arm/health', self._driver_health_cb,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL),
+            callback_group=self.cb,
         )
         self.create_subscription(
             RobotStatus,
@@ -110,6 +120,7 @@ class OfficialTrajectoryAdapter(Node):
     def _declare_parameters(self) -> None:
         self.declare_parameter("official_status_topic", "/arm_status")
         self.declare_parameter("official_command_topic", "/arm_cmd")
+        self.declare_parameter("require_driver_health", False)
         self.declare_parameter("action_name", "/x5a_arm_controller/follow_joint_trajectory")
         self.declare_parameter(
             "gripper_action_name", "/x5a_gripper_controller/gripper_cmd"
@@ -124,6 +135,9 @@ class OfficialTrajectoryAdapter(Node):
         self.declare_parameter("max_status_speed_rad_s", 1.5)
         self.declare_parameter("start_tolerance_rad", 0.15)
         self.declare_parameter("goal_tolerance_rad", 0.01)
+        self.declare_parameter('enforce_goal_tolerance', True)
+        self.declare_parameter('goal_advisory_tolerance_rad', 0.06)
+        self.declare_parameter('goal_advisory_settle_sec', 0.15)
         self.declare_parameter("goal_time_tolerance_sec", 2.0)
         self.declare_parameter("tracking_grace_sec", 0.75)
         self.declare_parameter("tracking_tolerance_rad", 0.15)
@@ -135,6 +149,7 @@ class OfficialTrajectoryAdapter(Node):
         self.declare_parameter("gripper_open_readout", 5.0)
         self.declare_parameter("gripper_finger_max_m", 0.044)
         self.declare_parameter("gripper_command_duration_sec", 0.8)
+        self.declare_parameter("gripper_open_ramp_sec", 0.0)
         self.declare_parameter("gripper_goal_tolerance_m", 0.004)
         self.declare_parameter("gripper_open_threshold_m", 0.03)
 
@@ -142,6 +157,7 @@ class OfficialTrajectoryAdapter(Node):
         g = lambda name: self.get_parameter(name).value
         self.status_topic = str(g("official_status_topic"))
         self.command_topic = str(g("official_command_topic"))
+        self.require_driver_health = bool(g("require_driver_health"))
         self.action_name = str(g("action_name"))
         self.gripper_action_name = str(g("gripper_action_name"))
         self.joint_state_topic = str(g("joint_state_topic"))
@@ -155,6 +171,9 @@ class OfficialTrajectoryAdapter(Node):
         self.max_status_speed = float(g("max_status_speed_rad_s"))
         self.start_tolerance = float(g("start_tolerance_rad"))
         self.goal_tolerance = float(g("goal_tolerance_rad"))
+        self.enforce_goal_tolerance = bool(g('enforce_goal_tolerance'))
+        self.goal_advisory_tolerance = float(g('goal_advisory_tolerance_rad'))
+        self.goal_advisory_settle = float(g('goal_advisory_settle_sec'))
         self.goal_time_tolerance = float(g("goal_time_tolerance_sec"))
         self.tracking_grace = float(g("tracking_grace_sec"))
         self.tracking_tolerance = float(g("tracking_tolerance_rad"))
@@ -166,8 +185,15 @@ class OfficialTrajectoryAdapter(Node):
         self.gripper_open = float(g("gripper_open_readout"))
         self.finger_max = float(g("gripper_finger_max_m"))
         self.gripper_duration = float(g("gripper_command_duration_sec"))
+        self.gripper_open_ramp = float(g("gripper_open_ramp_sec"))
+        if not 0. <= self.gripper_open_ramp <= 2.:
+            raise ValueError("gripper opening ramp must be in [0, 2] seconds")
         self.gripper_tolerance = float(g("gripper_goal_tolerance_m"))
         self.gripper_open_threshold = float(g("gripper_open_threshold_m"))
+        if not self.enforce_goal_tolerance and not (
+                self.goal_tolerance <= self.goal_advisory_tolerance < self.tracking_tolerance
+                and 0. <= self.goal_advisory_settle <= self.goal_time_tolerance):
+            raise ValueError('invalid advisory arrival tolerance or settle interval')
 
     def finger_position(self, readout: float) -> float:
         span = self.gripper_open - self.gripper_closed
@@ -290,7 +316,38 @@ class OfficialTrajectoryAdapter(Node):
             q = None if self.q is None else list(self.q)
             return q, list(self.end_pos), float(self.gripper), float(self.last_status_time)
 
+    def _driver_health_cb(self, msg: String) -> None:
+        try:
+            health = json.loads(msg.data)
+            if not isinstance(health, dict) or not all(
+                isinstance(health.get(k), bool) for k in ('online', 'protected', 'ready')
+            ):
+                raise ValueError('invalid health fields')
+        except (ValueError, TypeError):
+            health = {'online': False, 'protected': True, 'ready': False}
+        with self.lock:
+            self.driver_health = health
+            self.driver_health_time = time.monotonic()
+
+    def driver_health_fault(self) -> str:
+        with self.lock:
+            health = self.driver_health
+            if health is None:
+                return 'no motor feedback health' if self.require_driver_health else ''
+            if time.monotonic() - self.driver_health_time > self.status_timeout:
+                return 'motor feedback health is stale'
+            if not health['online']:
+                return 'motor feedback lost'
+            if health['protected']:
+                return 'motor protection latched; cancel task and prepare again'
+            if not health['ready']:
+                return 'motor feedback has not settled'
+        return ''
+
     def readiness_fault(self) -> str:
+        health_fault = self.driver_health_fault()
+        if health_fault:
+            return health_fault
         now = time.monotonic()
         with self.lock:
             if self.q is None:
@@ -382,6 +439,7 @@ class OfficialTrajectoryAdapter(Node):
         msg.gripper = float(gripper)
         msg.mode = self.position_mode
         self.cmd_pub.publish(msg)
+        self.last_arm_target = list(joints)
 
     def _execute_gripper(self, goal_handle):
         result = GripperCommand.Result()
@@ -390,17 +448,32 @@ class OfficialTrajectoryAdapter(Node):
         )
         target_readout = self.gripper_readout(target_m)
         try:
-            _, _, actual_readout, _ = self.snapshot()
+            initial_q, hold_end, actual_readout, initial_stamp = self.snapshot()
+            if initial_q is None or time.monotonic()-initial_stamp > self.status_timeout:
+                goal_handle.abort()
+                return result
+            hold_q = list(getattr(self, "last_arm_target", initial_q))
+            if max(abs(a-b) for a,b in zip(hold_q, initial_q)) > self.start_tolerance:
+                goal_handle.abort()
+                return result
+            initial_readout = actual_readout
             actual_before = self.finger_position(actual_readout)
             self.get_logger().info(
                 f"[GRIPPER] GRIPPER_EXEC_START t_ns={now_ns()} "
                 f"target_m={target_m:.4f} actual_before={actual_before:.4f}"
             )
-            deadline = time.monotonic() + self.gripper_duration
+            started = time.monotonic()
+            ramp = getattr(self, "gripper_open_ramp", 0.) if target_m > actual_before else 0.
+            deadline = started + self.gripper_duration + ramp
             period = 1.0 / max(5.0, self.rate_hz)
             while time.monotonic() < deadline:
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
+                    return result
+                fault = self.driver_health_fault()
+                if fault:
+                    self.get_logger().error(f'GRIPPER_ABORT reason={fault}')
+                    goal_handle.abort()
                     return result
                 q, end_pos, actual_readout, stamp = self.snapshot()
                 if q is None or time.monotonic() - stamp > self.status_timeout:
@@ -417,7 +490,13 @@ class OfficialTrajectoryAdapter(Node):
                     )
                     goal_handle.abort()
                     return result
-                self._publish_command(q, end_pos, target_readout)
+                if max(abs(a-b) for a,b in zip(hold_q, q)) > self.tracking_tolerance:
+                    goal_handle.abort()
+                    return result
+                alpha = min(1., (time.monotonic()-started)/ramp) if ramp > 0. else 1.
+                alpha = alpha*alpha*(3.-2.*alpha)
+                command = initial_readout+(target_readout-initial_readout)*alpha
+                self._publish_command(hold_q, hold_end, command)
                 actual_m = self.finger_position(actual_readout)
                 feedback = GripperCommand.Feedback()
                 feedback.position = actual_m
@@ -590,10 +669,17 @@ class OfficialTrajectoryAdapter(Node):
                 time.sleep(period)
 
             deadline = time.monotonic() + self.goal_time_tolerance
+            settle_started = time.monotonic()
             final = points[-1][1]
             error = float("inf")
             actual = None
             while time.monotonic() < deadline:
+                fault = self.driver_health_fault()
+                if fault:
+                    return self._arm_abort(
+                        goal_handle, result, FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
+                        fault, elapsed=time.monotonic() - started, desired=final,
+                    )
                 actual, latest_end, _, stamp = self.snapshot()
                 if actual is None or time.monotonic() - stamp > self.status_timeout:
                     break
@@ -601,7 +687,16 @@ class OfficialTrajectoryAdapter(Node):
                 command_count += 1
                 error = max(abs(a - b) for a, b in zip(actual, final))
                 self._feedback(goal_handle, final, actual)
-                if error <= self.goal_tolerance:
+                advisory = (not self.enforce_goal_tolerance
+                    and error <= self.goal_advisory_tolerance
+                    and time.monotonic()-settle_started >= self.goal_advisory_settle
+                    and all(abs(target-start) < self.response_command_delta
+                            or abs(measured-start) >= self.response_actual_delta
+                            for target, start, measured in zip(final, q0, actual)))
+                if error <= self.goal_tolerance or advisory:
+                    if advisory and error > self.goal_tolerance:
+                        self.get_logger().warn(
+                            f'[ARM] 到位小偏差 {error:.4f} rad，仅提示并继续后续动作')
                     result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
                     goal_handle.succeed()
                     self.get_logger().info(

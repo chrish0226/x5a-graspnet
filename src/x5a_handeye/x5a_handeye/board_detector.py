@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Detect ChArUco board pose from RealSense RGB and publish PoseStamped + TF + debug image."""
+"""Detect ChArUco with camera intrinsics, quality checks and raw observations."""
 from __future__ import annotations
 
 import math
+import json
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -15,9 +16,12 @@ from geometry_msgs.msg import PoseStamped, TransformStamped
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
+from std_msgs.msg import String
 from tf2_ros import TransformBroadcaster
 
 from x5a_handeye.transforms import R_to_quat, rvec_tvec_to_T
+from x5a_handeye.charuco_detection import (
+    DETECTOR_VERSION, detect_charuco, pose_quality, quality_passes)
 
 
 def load_board(config_path: str):
@@ -42,6 +46,8 @@ class BoardDetector(Node):
         self.declare_parameter("image_topic", "/camera/camera/color/image_raw")
         self.declare_parameter("camera_info_topic", "/camera/camera/color/camera_info")
         self.declare_parameter("min_charuco_corners", 6)
+        self.declare_parameter('max_reprojection_error_px', 2.0)
+        self.declare_parameter('max_board_tilt_deg', 75.0)
         self.declare_parameter("publish_tf", True)
         self.declare_parameter("board_frame", "calibration_board")
 
@@ -54,6 +60,8 @@ class BoardDetector(Node):
             )
         self.dictionary, self.board, self.cfg = load_board(board_config)
         self.min_corners = int(self.get_parameter("min_charuco_corners").value)
+        self.max_reprojection = float(self.get_parameter('max_reprojection_error_px').value)
+        self.max_tilt = float(self.get_parameter('max_board_tilt_deg').value)
         self.publish_tf = bool(self.get_parameter("publish_tf").value)
         self.board_frame = str(self.get_parameter("board_frame").value)
         self.params = (
@@ -65,6 +73,7 @@ class BoardDetector(Node):
         self.K: Optional[np.ndarray] = None
         self.D: Optional[np.ndarray] = None
         self.camera_frame = ""
+        self.info_size = None
         self.last_T: Optional[np.ndarray] = None
         self.last_quality = 0
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -74,35 +83,26 @@ class BoardDetector(Node):
         self.create_subscription(Image, image_topic, self.on_image, qos_profile_sensor_data)
         self.create_subscription(CameraInfo, info_topic, self.on_info, qos_profile_sensor_data)
         self.pose_pub = self.create_publisher(PoseStamped, "/calibration_board/pose", 10)
+        self.observation_pub = self.create_publisher(String, '/calibration_board/observation', 10)
         self.debug_pub = self.create_publisher(Image, "/x5a_handeye/debug_image", 10)
         self.get_logger().info(
             f"board detector ready image={image_topic} info={info_topic} config={board_config}"
         )
 
     def on_info(self, msg: CameraInfo) -> None:
-        self.K = np.array(msg.k, dtype=float).reshape(3, 3)
-        self.D = np.array(msg.d, dtype=float).reshape(-1)
+        K = np.array(msg.k, dtype=float).reshape(3, 3)
+        D = np.array(msg.d, dtype=float).reshape(-1)
+        if (not np.isfinite(K).all() or not np.isfinite(D).all()
+                or K[0, 0] <= 0 or K[1, 1] <= 0 or not msg.header.frame_id):
+            self.K = None
+            return
+        self.K, self.D = K, D
         self.camera_frame = msg.header.frame_id
+        self.info_size = (msg.width, msg.height)
 
     def detect(self, bgr: np.ndarray):
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        if hasattr(cv2.aruco, "CharucoDetector"):
-            det = cv2.aruco.CharucoDetector(self.board)
-            charuco_corners, charuco_ids, marker_corners, marker_ids = det.detectBoard(gray)
-        else:
-            if hasattr(cv2.aruco, "ArucoDetector"):
-                mdet = cv2.aruco.ArucoDetector(self.dictionary, self.params)
-                marker_corners, marker_ids, rejected = mdet.detectMarkers(gray)
-            else:
-                marker_corners, marker_ids, rejected = cv2.aruco.detectMarkers(
-                    gray, self.dictionary, parameters=self.params
-                )
-            charuco_corners = charuco_ids = None
-            if marker_ids is not None and len(marker_ids) > 0:
-                _, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
-                    marker_corners, marker_ids, gray, self.board
-                )
-        return marker_corners, marker_ids, charuco_corners, charuco_ids
+        return detect_charuco(gray, self.dictionary, self.board, self.params, self.K, self.D)
 
     def estimate_pose(self, charuco_corners, charuco_ids) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]:
         if (
@@ -130,13 +130,24 @@ class BoardDetector(Node):
     def on_image(self, msg: Image) -> None:
         if self.K is None:
             return
+        if (msg.header.frame_id != self.camera_frame
+                or (msg.width, msg.height) != self.info_size):
+            self.get_logger().warn('image and CameraInfo frame/size disagree', throttle_duration_sec=5.0)
+            return
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         marker_corners, marker_ids, charuco_corners, charuco_ids = self.detect(frame)
         debug = frame.copy()
         if marker_ids is not None and len(marker_ids) > 0:
             cv2.aruco.drawDetectedMarkers(debug, marker_corners, marker_ids)
         n_corners = 0 if charuco_ids is None else int(len(charuco_ids))
-        ok, rvec, tvec = self.estimate_pose(charuco_corners, charuco_ids)
+        try:
+            ok, rvec, tvec = self.estimate_pose(charuco_corners, charuco_ids)
+        except cv2.error:
+            ok, rvec, tvec = False, None, None
+        quality = None
+        if ok:
+            quality = pose_quality(self.board, charuco_corners, charuco_ids, self.K, self.D, rvec, tvec)
+            ok = quality_passes(quality, self.min_corners, self.max_reprojection, self.max_tilt)
         if ok:
             if charuco_corners is not None and charuco_ids is not None:
                 cv2.aruco.drawDetectedCornersCharuco(debug, charuco_corners, charuco_ids)
@@ -158,6 +169,20 @@ class BoardDetector(Node):
             pose.pose.orientation.z = qz
             pose.pose.orientation.w = qw
             self.pose_pub.publish(pose)
+            observation = {
+                'stamp_ns': int(msg.header.stamp.sec)*1000000000 + int(msg.header.stamp.nanosec),
+                'camera_frame': self.camera_frame,
+                'image_size': [int(msg.width), int(msg.height)],
+                'K': self.K.tolist(), 'D': self.D.tolist(),
+                'board': self.cfg['board'], 'detector_version': DETECTOR_VERSION,
+                'opencv_version': cv2.__version__,
+                'quality': quality,
+                'marker_ids': np.asarray(marker_ids).reshape(-1).tolist(),
+                'marker_corners_px': [np.asarray(c).reshape(-1, 2).tolist() for c in marker_corners],
+                'charuco_ids': np.asarray(charuco_ids).reshape(-1).tolist(),
+                'charuco_corners_px': np.asarray(charuco_corners).reshape(-1, 2).tolist(),
+            }
+            self.observation_pub.publish(String(data=json.dumps(observation, allow_nan=False)))
             if self.publish_tf:
                 tf = TransformStamped()
                 tf.header = pose.header
@@ -172,7 +197,7 @@ class BoardDetector(Node):
                 self.tf_broadcaster.sendTransform(tf)
             cv2.putText(
                 debug,
-                f"corners={n_corners} t=[{xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f}]",
+                f"corners={n_corners} rms={quality['reprojection_rms_px']:.2f}px tilt={quality['tilt_deg']:.1f}",
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -184,14 +209,17 @@ class BoardDetector(Node):
             self.last_quality = n_corners
             cv2.putText(
                 debug,
-                f"NO POSE corners={n_corners}",
+                (f"REJECT rms={quality['reprojection_rms_px']:.2f}px tilt={quality['tilt_deg']:.1f}"
+                 if quality else f"NO POSE corners={n_corners}"),
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (0, 0, 255),
                 2,
             )
-        self.debug_pub.publish(self.bridge.cv2_to_imgmsg(debug, encoding="bgr8"))
+        debug_msg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
+        debug_msg.header = msg.header
+        self.debug_pub.publish(debug_msg)
 
 
 def main(args=None):

@@ -1,0 +1,49 @@
+diff --git a/trac_ik_kinematics_plugin/include/trac_ik/trac_ik_kinematics_plugin.hpp b/trac_ik_kinematics_plugin/include/trac_ik/trac_ik_kinematics_plugin.hpp
+index 8f0320f..3bcc217 100644
+--- a/trac_ik_kinematics_plugin/include/trac_ik/trac_ik_kinematics_plugin.hpp
++++ b/trac_ik_kinematics_plugin/include/trac_ik/trac_ik_kinematics_plugin.hpp
+@@ -31,8 +31,8 @@ OF THE POSSIBILITY OF SUCH DAMAGE.
+ #ifndef TRAC_IK_KINEMATICS_PLUGIN_
+ #define TRAC_IK_KINEMATICS_PLUGIN_
+ 
+-#include <moveit/kinematics_base/kinematics_base.hpp>
+-#include <moveit/robot_model/robot_model.hpp>
++#include <moveit/kinematics_base/kinematics_base.h>
++#include <moveit/robot_model/robot_model.h>
+ #include <kdl/chain.hpp>
+ #include <kdl/jntarray.hpp>
+ 
+diff --git a/trac_ik_kinematics_plugin/src/trac_ik_kinematics_plugin.cpp b/trac_ik_kinematics_plugin/src/trac_ik_kinematics_plugin.cpp
+index 5000f14..e46930b 100644
+--- a/trac_ik_kinematics_plugin/src/trac_ik_kinematics_plugin.cpp
++++ b/trac_ik_kinematics_plugin/src/trac_ik_kinematics_plugin.cpp
+@@ -130,6 +130,14 @@ bool TRAC_IKKinematicsPlugin::initialize(const rclcpp::Node::SharedPtr &node,
+         joint_min(joint_num - 1) = std::numeric_limits<float>::lowest();
+         joint_max(joint_num - 1) = std::numeric_limits<float>::max();
+       }
++      // X5A's calibrated URDF has broad legacy limits. Honor the active
++      // MoveIt bounds (including commissioned joint4 stop) during the solve.
++      const auto& active_bounds = robot_model.getVariableBounds(joint->name);
++      if (active_bounds.position_bounded_)
++      {
++        joint_min(joint_num - 1) = std::max(joint_min(joint_num - 1), active_bounds.min_position_);
++        joint_max(joint_num - 1) = std::min(joint_max(joint_num - 1), active_bounds.max_position_);
++      }
+       RCLCPP_INFO_STREAM(LOGGER, "IK Using joint " << chain_segs[i].getName() << " " << joint_min(joint_num - 1) << " " << joint_max(joint_num - 1));
+     }
+   }
+diff --git a/trac_ik_lib/CMakeLists.txt b/trac_ik_lib/CMakeLists.txt
+index 2a1faff..e5bfa64 100644
+--- a/trac_ik_lib/CMakeLists.txt
++++ b/trac_ik_lib/CMakeLists.txt
+@@ -26,8 +26,9 @@ set(DEPS
+ )
+ 
+ add_library(trac_ik SHARED src/kdl_tl.cpp src/nlopt_ik.cpp src/trac_ik.cpp)
+-target_link_libraries(trac_ik ${pkg_nlopt_LIBRARIES})
++target_link_libraries(trac_ik ${NLOPT_LIBRARIES})
+ target_include_directories(trac_ik PUBLIC
++  ${NLOPT_INCLUDE_DIRS}
+   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+   $<INSTALL_INTERFACE:include>
+ )

@@ -27,6 +27,8 @@ class X5aTaskServer(PickPlaceNode):
         self._mqtt_defer_success = False
         self._last_stage = "IDLE"
         self._action_cb = ReentrantCallbackGroup()
+        self.declare_parameter('task.action_name', '/x5a/pick_place')
+        self.task_action_name = str(self.get_parameter('task.action_name').value)
         self.set_stage_callback(self._on_stage)
         self.stage_pub = self.create_publisher(String, "/x5a/task_stage", 10)
         self.busy_pub = self.create_publisher(Bool, "/x5a/task_busy", 10)
@@ -34,7 +36,7 @@ class X5aTaskServer(PickPlaceNode):
         self._action_server = ActionServer(
             self,
             X5aPickPlace,
-            "/x5a/pick_place",
+            self.task_action_name,
             execute_callback=self.execute_callback,
             goal_callback=self.goal_callback,
             cancel_callback=self.cancel_callback,
@@ -42,7 +44,7 @@ class X5aTaskServer(PickPlaceNode):
         )
         self._set_idle("IDLE")
         self.get_logger().info(
-            "X5A TASK SERVER: READY action=/x5a/pick_place "
+            f"X5A TASK SERVER: READY action={self.task_action_name} "
             f"plan_only={self.plan_only} vision={self.vision_enabled}"
         )
 

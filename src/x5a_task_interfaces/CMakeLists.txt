@@ -10,6 +10,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/PickPlace.action"
   "action/PlanRemoteGrasp.action"
   "action/X5aPickPlace.action"
+  "action/ColorSequence.action"
   "srv/ParallelIK.srv"
   DEPENDENCIES geometry_msgs moveit_msgs
 )

@@ -1,0 +1,17 @@
+{
+  "status": "candidate_only_not_applied",
+  "added_mass_kg": 0.225,
+  "camera_from_joint4_in_link6_axes_m": [0.05040833264451424, 0.0, 0.022],
+  "measurement_joint5_joint6_rad": [0.005268425530708685, -0.10966540514008978],
+  "measured_distance_m": 0.055,
+  "reported_other_offset_m": 0.022,
+  "mass_includes": "camera, mounting parts and moving cable, per user",
+  "assumptions": [
+    "Interpret 22mm as the perpendicular component; its direction is approximate from the photograph.",
+    "+X points toward the fingers. Approximate the camera-side perpendicular offset as +Z; lateral Y is unmeasured and set to zero.",
+    "Use the camera casing centre as the combined payload COM approximation; mounting and cable COM were not separately measured.",
+    "Use joint5/joint6 averaged from the read-only wrist capture as the measurement posture; these angles were not recorded with the photograph.",
+    "Treat the added payload as a point mass; its intrinsic inertia is unknown.",
+    "Offline prediction reduces joint4 gravity compensation relative to the mass-only model. This is not a verified fix for wrist sag."
+  ]
+}

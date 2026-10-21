@@ -4,6 +4,7 @@ Coordinates follow GraspNet: X approach, Y closing, Z finger height.
 No ROS, GPU, or network dependencies. Distances are metres.
 """
 from dataclasses import dataclass
+import math
 import numpy as np
 
 
@@ -19,6 +20,7 @@ class GripperGeometry:
     noise_margin: float = 0.002
     min_contact_points: int = 12
     min_collision_voxels: int = 3
+    cad_model: object = None
 
     def __post_init__(self):
         values = [self.tip_offset, self.finger_length, self.finger_thickness,
@@ -44,7 +46,15 @@ def voxel_cloud(points, size=0.003):
     points = finite_cloud(points)
     if not len(points):
         return points
-    _, indices = np.unique(np.floor(points / size).astype(np.int64), axis=0, return_index=True)
+    cells = np.floor(points / size).astype(np.int64)
+    low, high = cells.min(axis=0), cells.max(axis=0)
+    shape = [int(b)-int(a)+1 for a, b in zip(low, high)]
+    if math.prod(shape) <= np.iinfo(np.int64).max:
+        relative = cells-low
+        keys = (relative[:, 0]*shape[1]+relative[:, 1])*shape[2]+relative[:, 2]
+        _, indices = np.unique(keys, return_index=True)
+    else:
+        _, indices = np.unique(cells, axis=0, return_index=True)
     return points[np.sort(indices)]
 
 
@@ -69,6 +79,17 @@ def depth_cloud(depth_m, fx, fy, cx, cy):
         raise ValueError('invalid RGB-D intrinsics/depth')
     y, x = np.indices(depth.shape)
     return np.stack([(x-cx)*depth/fx, (y-cy)*depth/fy, depth], axis=-1)
+
+
+def depth_points(depth_m, mask, fx, fy, cx, cy):
+    """Project only selected pixels, preserving row-major order and raw depth."""
+    depth, mask = np.asarray(depth_m, float), np.asarray(mask, bool)
+    if (depth.ndim != 2 or mask.shape != depth.shape
+            or not np.all(np.isfinite([fx, fy, cx, cy])) or min(fx, fy) <= 0):
+        raise ValueError('invalid RGB-D intrinsics/depth/mask')
+    y, x = np.nonzero(mask)
+    z = depth[mask]
+    return np.column_stack(((x-cx)*z/fx, (y-cy)*z/fy, z))
 
 
 def height_statistics(points, transform):
@@ -127,6 +148,8 @@ def assess_tool_grasp(target, scene, tool, geometry, approach_distance=0.04):
     tool = np.asarray(tool, dtype=float)
     if tool.shape != (4, 4) or not np.all(np.isfinite(tool)):
         raise ValueError('invalid tool transform')
+    if geometry.cad_model is not None:
+        return geometry.cad_model.assess(target, scene, tool, geometry, approach_distance)
     r, t = tool[:3, :3], tool[:3, 3]
     measure = opening_measurement(target, r, t, geometry.tip_offset,
                                   geometry.pad_length, geometry.finger_height,
@@ -175,9 +198,11 @@ def assess_tool_grasp(target, scene, tool, geometry, approach_distance=0.04):
 
 def recenter_tool(target, tool, geometry, max_shift=0.015):
     tool = np.array(tool, copy=True)
-    measure = opening_measurement(target, tool[:3, :3], tool[:3, 3],
-                                  geometry.tip_offset, geometry.pad_length,
-                                  geometry.finger_height, geometry.min_contact_points)
+    measure = (geometry.cad_model.contact_measurement(target, tool, geometry.min_contact_points)
+               if geometry.cad_model is not None else
+               opening_measurement(target, tool[:3, :3], tool[:3, 3],
+                   geometry.tip_offset, geometry.pad_length,
+                   geometry.finger_height, geometry.min_contact_points))
     if measure is not None:
         shift = float(measure['center_offset_m'])
         if abs(shift) <= max_shift:
@@ -189,7 +214,9 @@ def graspnet_tool_transform(transform, depth, mapping):
     """Mapping translation is tip calibration, separate from network insertion.
 
     GraspNet fingertip = t + depth*R[:,0]. For the current X5A mapping,
-    mapping[0,3] = -tip_offset, so tool0 = t+(depth-tip_offset)*approach.
+    mapping[0,3] is the negative insertion reference. Stock wrist CAD
+    keeps its measured physical tip separate from the successful native insertion
+    reference; contact and collision always use the actual CAD model.
     """
     if not np.isfinite(depth) or not 0 < depth <= 0.10:
         raise ValueError('invalid GraspNet insertion depth')

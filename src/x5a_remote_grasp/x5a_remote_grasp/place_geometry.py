@@ -3,6 +3,7 @@
 The observed object cloud is attached to tool0 at the measured grasp pose.
 It is transformed again for every release orientation, including its bottom.
 """
+import itertools
 import numpy as np
 from .grasp_quality import finite_cloud
 
@@ -65,6 +66,137 @@ def support_surface(points_base):
         raise ValueError('放置支撑面过小')
     center = ((hull+nxt)*cross[:, None]).sum(axis=0)/(3*cross.sum())
     return np.r_[center, np.median(face[:, 2])], hull
+
+
+def cube_face_axes(points_base):
+    """Estimate square top-face edges modulo 90 degrees. PCA is unstable for
+    squares, so fit a minimum-area rectangle to the observed top-face hull.
+    Return None when the face is too small, elongated, or poorly observed.
+    """
+    points = finite_cloud(points_base)
+    if len(points) < 40:
+        return None
+    face = points[points[:, 2] >= np.percentile(points[:, 2], 95)-.004]
+    if len(face) < 30:
+        return None
+    lo, hi = np.percentile(face[:, :2], [1, 99], axis=0)
+    # Do not clip genuine rotated corners to axis-aligned percentile bounds:
+    # that invents horizontal edges when a cube is almost axis-aligned.
+    xy = face[np.all((face[:, :2] >= lo-.001) & (face[:, :2] <= hi+.001), axis=1), :2]
+    hull = _hull(xy)
+    if len(hull) < 4:
+        return None
+    edge = np.roll(hull, -1, axis=0)-hull
+    angles = np.unique(np.round(np.arctan2(edge[:, 1], edge[:, 0]) % (np.pi/2), 6))
+    best = None
+    for angle in angles:
+        c, s = np.cos(angle), np.sin(angle)
+        local = hull @ np.array([[c, -s], [s, c]])
+        size = np.ptp(local, axis=0)
+        area = float(np.prod(size))
+        if best is None or area < best[0]:
+            best = (area, angle, size, (local.min(axis=0)+local.max(axis=0))/2)
+    area, angle, size, local_center = best
+    hull_area = abs(float(np.sum(hull[:, 0]*np.roll(hull[:, 1], -1)
+                                 - hull[:, 1]*np.roll(hull[:, 0], -1))))/2
+    coverage = hull_area/max(area, 1e-12)
+    if np.min(size) < .012 or np.max(size) > .12 or np.max(size)/np.min(size) > 1.35 or coverage < .86:
+        return None
+    c, s = np.cos(angle), np.sin(angle)
+    center = local_center @ np.array([[c, s], [-s, c]])
+    return dict(yaw_rad=float(angle), size_xy_m=size.tolist(), center_xy_m=center.tolist(),
+                coverage=float(coverage), points=len(xy))
+
+
+def cube_placement_cloud(points_base, table_top=-.006):
+    """Complete a recognized cube's hidden bottom from its observed square face.
+
+    Depth often sees only its top. Treating that top as the object's bottom
+    lowers the release by a full cube height. This prior is placement-only.
+    """
+    points = finite_cloud(points_base)
+    axes = cube_face_axes(points)
+    if axes is None:
+        return points
+    size = np.asarray(axes['size_xy_m'])
+    # Restrict the cube prior to the project's small blocks, not general boxes.
+    if np.min(size) < .020 or np.max(size) > .055:
+        return points
+    height = float(np.mean(size))
+    top = float(np.percentile(points[:, 2], 95))
+    bottom = max(float(table_top), top-height)
+    if top-bottom < height*.75:
+        return points  # geometry inconsistent with a cube on this table
+    a = np.linspace(-.5, .5, 21)
+    x, y = np.meshgrid(a*size[0], a*size[1])
+    c, s = np.cos(axes['yaw_rad']), np.sin(axes['yaw_rad'])
+    xy = np.c_[x.ravel(), y.ravel()] @ np.array([[c, s], [-s, c]])+axes['center_xy_m']
+    # Dense bottom samples survive robust 2nd-percentile placement bounds.
+    hidden_bottom = np.c_[xy, np.full(len(xy), bottom)]
+    return np.vstack([points, hidden_bottom])
+
+
+def cube_alignment_rotations(points_tool, grasp_rotation, support_axes):
+    source = cube_face_axes(np.asarray(points_tool) @ np.asarray(grasp_rotation).T)
+    if source is None or support_axes is None:
+        return []
+    quarter = np.pi/2
+    delta = (support_axes['yaw_rad']-source['yaw_rad']+quarter/2) % quarter-quarter/2
+    rotations = []
+    for angle in (delta, delta+quarter, delta-quarter, delta+np.pi):
+        c, s = np.cos(angle), np.sin(angle)
+        rotations.append(np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]]) @ grasp_rotation)
+    return rotations
+
+
+def cube_face_placement_rotations(points_tool, grasp_rotation, support_axes=None):
+    """All 24 face-equivalent placements of a small, fully modeled cube.
+
+    A cube may change which face points upward without losing a flat support
+    face or aligned edges. General objects keep the original upright policy.
+    """
+    grasp = np.asarray(grasp_rotation, dtype=float)
+    world = finite_cloud(points_tool) @ grasp.T
+    axes = cube_face_axes(world)
+    if axes is None:
+        return []
+    size = np.asarray(axes['size_xy_m'])
+    height = float(np.ptp(np.percentile(world[:, 2], [2, 98])))
+    if (np.min(size) < .020 or np.max(size) > .055
+            or np.max(size)/np.min(size) > 1.15
+            or not .80 <= height/np.mean(size) <= 1.20):
+        return []
+    def rz(yaw):
+        c, s = np.cos(yaw), np.sin(yaw)
+        return np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]])
+    source = rz(axes['yaw_rad'])
+    target = rz(axes['yaw_rad'] if support_axes is None else support_axes['yaw_rad'])
+    rotations = []
+    for permutation in itertools.permutations(range(3)):
+        for signs in itertools.product((-1., 1.), repeat=3):
+            symmetry = np.eye(3)[:, permutation]*np.asarray(signs)
+            if np.linalg.det(symmetry) < .5:
+                continue
+            rotation = target @ symmetry @ source.T @ grasp
+            rotations.append(rotation)
+    # Prefer a horizontal jaw closing axis: one downward-pointing finger was
+    # the limiting collision in the observed failures. Full paths still decide.
+    rotations.sort(key=lambda rotation: (
+        abs(float(rotation[2, 1])),
+        abs(float(np.arctan2(-rotation[2, 0], np.linalg.norm(rotation[:2, 0])))-.6),
+        float(np.arccos(np.clip((np.trace(grasp.T@rotation)-1)/2, -1., 1.)))))
+    return rotations
+
+
+def cube_alignment_report(points_tool, place_tool, support_axes):
+    if support_axes is None:
+        return None
+    placed = cube_face_axes(np.asarray(points_tool) @ place_tool[:3, :3].T)
+    if placed is None:
+        return None
+    quarter = np.pi/2
+    error = (placed['yaw_rad']-support_axes['yaw_rad']+quarter/2) % quarter-quarter/2
+    return dict(error_deg=float(abs(np.degrees(error))), support=support_axes, placed=placed)
 
 
 def supported_center(point_xy, hull, margin=0.004):

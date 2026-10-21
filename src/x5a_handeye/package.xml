@@ -3,11 +3,15 @@
 <package format="3">
   <name>x5a_handeye</name>
   <version>0.1.0</version>
-  <description>Eye-to-hand calibration for ARX X5A with fixed RealSense and board on tool.</description>
+  <description>Eye-in-hand and eye-to-hand calibration for ARX X5A.</description>
   <maintainer email="user@example.com">x5a user</maintainer>
   <license>BSD</license>
   <buildtool_depend>ament_python</buildtool_depend>
   <depend>rclpy</depend>
+  <exec_depend>arx5_arm_msg</exec_depend>
+  <exec_depend>orbbec_camera</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>xacro</exec_depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>

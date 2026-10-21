@@ -9,7 +9,10 @@
   <buildtool_depend>ament_python</buildtool_depend>
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>sensor_msgs</depend>
   <depend>x5a_pick_place</depend>
+  <exec_depend>x5a_vision</exec_depend>
   <depend>x5a_task_interfaces</depend>
   <exec_depend>python3-paho-mqtt</exec_depend>
   <export>

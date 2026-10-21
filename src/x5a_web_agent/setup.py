@@ -11,6 +11,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", glob("launch/*.py")),
         ("share/" + package_name + "/static", glob("static/*")),
+        ("share/" + package_name + "/static_sam", glob("static_sam/*")),
         ("share/" + package_name + "/certs", glob("certs/*")),
     ],
     install_requires=["setuptools", "fastapi", "uvicorn", "paho-mqtt>=1.5"],
@@ -21,7 +22,9 @@ setup(
     license="BSD",
     entry_points={
         "console_scripts": [
-            "web_agent = x5a_web_agent.app:main",
+            "web_agent = x5a_web_agent.wrist_app:main",
+            "wrist_web_agent = x5a_web_agent.wrist_app:main",
+            "sam_web_agent = x5a_web_agent.app:main",
             "text_cli = x5a_web_agent.text_cli:main",
         ]
     },

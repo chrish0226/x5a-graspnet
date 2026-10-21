@@ -1,0 +1,119 @@
+# Wrist camera with undistorted color and software-aligned depth (mm).
+/**:
+  ros__parameters:
+    color_topic: /wrist_camera/color/image_raw
+    aligned_depth_topic: /wrist_camera/depth/image_raw
+    camera_info_topic: /wrist_camera/color/camera_info
+    optical_frame: wrist_camera_color_optical_frame
+    base_frame: base_link
+    colors:
+      red:
+        hsv_lower:
+        - 0
+        - 80
+        - 55
+        hsv_upper:
+        - 7
+        - 255
+        - 255
+        use_second_hsv: true
+        hsv_lower_2:
+        - 170
+        - 80
+        - 55
+        hsv_upper_2:
+        - 179
+        - 255
+        - 255
+      white:
+        hsv_lower:
+        - 0
+        - 0
+        - 170
+        hsv_upper:
+        - 179
+        - 90
+        - 255
+        use_second_hsv: false
+        hsv_lower_2:
+        - 0
+        - 0
+        - 0
+        hsv_upper_2:
+        - 0
+        - 0
+        - 0
+      orange:
+        hsv_lower:
+        - 8
+        - 90
+        - 70
+        hsv_upper:
+        - 28
+        - 255
+        - 255
+        use_second_hsv: false
+        hsv_lower_2:
+        - 0
+        - 0
+        - 0
+        hsv_upper_2:
+        - 0
+        - 0
+        - 0
+    detection:
+      min_area_px: 500.0
+      max_area_px: 5000.0
+      min_rectangularity: 0.5
+      max_aspect_ratio: 1.8
+      open_iterations: 1
+      close_iterations: 2
+      inner_erode_px: 5
+    depth:
+      scale_16uc1: 0.001
+      min_m: 0.2
+      max_m: 0.8
+      near_percentile: 55.0
+    object:
+      size_x: 0.03
+      size_y: 0.03
+      size_z: 0.03
+    table:
+      z: -0.006
+      top_tolerance: 0.03
+    workspace:
+      x_min: -0.08
+      x_max: 0.48
+      y_min: 0.02
+      y_max: 0.58
+      r_max: 0.65
+      z_min: -0.015
+      z_max: 0.08
+      expected_x: 0.2
+      expected_y: 0.33
+    filter:
+      window: 10
+      max_std_x: 0.005
+      max_std_y: 0.005
+      max_std_z: 0.008
+      reset_distance_m: 0.03
+    box:
+      hsv_lower:
+      - 0
+      - 0
+      - 0
+      hsv_upper:
+      - 179
+      - 255
+      - 55
+      min_area_px: 8000.0
+      max_area_px: 80000.0
+      min_aspect_ratio: 1.1
+      max_aspect_ratio: 2.8
+      min_rectangularity: 0.7
+      border_margin_px: 5
+      open_iterations: 1
+      close_iterations: 2
+      filter_window: 10
+      max_std_xy: 0.01
+      reset_distance_m: 0.05

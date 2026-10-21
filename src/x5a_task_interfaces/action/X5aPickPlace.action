@@ -1,6 +1,12 @@
 # Persistent visual pick-and-place goal used by x5a_task_server.
 # Keep this separate from PickPlace.action (MTC uses field "color").
 string target_color
+# Empty or "box": place in the black box. A different color: stack on that cube.
+# Wrist-only "hold": pick and return to observation with the gripper closed.
+string destination_color
+# Optional ordered batch of distinct colors, all placed in the box.
+# Empty keeps target_color / destination_color single-task behavior.
+string[] target_colors
 # Sequence optimizations. Defaults keep single-task behavior.
 bool skip_return_home
 bool reuse_frozen_box

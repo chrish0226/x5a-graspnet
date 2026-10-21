@@ -6,11 +6,13 @@ It only talks to /x5a/pick_place and reads /x5a/task_stage.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
 import rclpy
+from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -78,12 +80,16 @@ class RosBridge:
         self._state_client = self._node.create_client(
             Trigger, "/x5a_remote_grasp/executor_state"
         )
+        self._remote_stop_client = self._node.create_client(
+            Trigger, '/x5a_remote_grasp/cancel'
+        )
         self._node.create_subscription(
             String, "/x5a/task_stage", self._on_stage_topic, 10
         )
         self._node.create_subscription(
             Bool, "/x5a/task_busy", self._on_busy_topic, 10
         )
+        self._node.create_subscription(String, '/x5a_remote_grasp/execution_stage', self._on_stage_topic, 10)
         self._executor = MultiThreadedExecutor(num_threads=4)
         self._executor.add_node(self._node)
         self._thread = threading.Thread(target=self._executor.spin, daemon=True)
@@ -135,21 +141,29 @@ class RosBridge:
     def busy(self) -> bool:
         with self._lock:
             local_busy = self._busy
-        if self._stage in TERMINAL_STAGES and not self._server_busy:
-            return False
-        return local_busy
+        return local_busy or self._server_busy
 
     def server_ready(self, timeout: float = 0.5) -> bool:
         if self.dry_run:
             return True
+        if os.environ.get('X5A_GRASP_ROUTE', 'remote').strip().lower() == 'remote':
+            remote = getattr(self, '_remote_client', None)
+            state = getattr(self, '_state_client', None)
+            return bool(remote is not None and remote.wait_for_server(timeout_sec=timeout)
+                        and state is not None and state.service_is_ready())
         if self._client is None:
             return False
         return bool(self._client.wait_for_server(timeout_sec=timeout))
 
     def cancel(self) -> bool:
+        stopped = False
+        remote_stop = getattr(self, '_remote_stop_client', None)
+        if remote_stop is not None and remote_stop.service_is_ready():
+            remote_stop.call_async(Trigger.Request())
+            stopped = True
         handle = self._goal_handle
         if handle is None:
-            return False
+            return stopped
         try:
             handle.cancel_goal_async()
             return True
@@ -469,8 +483,18 @@ class RosBridge:
         self._goal_handle = goal_handle
         result_future = goal_handle.get_result_async()
         if not self._wait(result_future, timeout):
+            goal_handle.cancel_goal_async()
             return {"success": False, "message": "等待远程抓取规划结果超时", "stage": "FAILED"}
         wrapped = result_future.result()
+        if wrapped is None:
+            return dict(success=False, stage='FAILED', message='远程规划没有返回结果', plan_valid=False)
+        if wrapped.status != GoalStatus.STATUS_SUCCEEDED:
+            # ABORTED is the normal failure path: preserve its useful reason.
+            detail = str(getattr(getattr(wrapped, 'result', None), 'error_message', '') or '').strip()
+            canceled = wrapped.status == GoalStatus.STATUS_CANCELED
+            fallback = '远程规划已取消' if canceled else '远程规划中止，服务未提供具体原因'
+            return dict(success=False, stage='CANCELED' if canceled else 'FAILED',
+                        message=detail or fallback, plan_valid=False)
         result = wrapped.result
         error_message = str(getattr(result, "error_message", "") or "")
         candidates = int(getattr(result, "candidate_count", 0) or 0)
@@ -485,6 +509,7 @@ class RosBridge:
                         "TCP 映射未确认，IK 与执行未运行，机械臂不会动。"
                     ),
                     "stage": "SUCCESS",
+                    'plan_valid': False,
                 }
             return {
                 "success": False,
@@ -495,6 +520,9 @@ class RosBridge:
         score = float(result.score)
         plan_note = "，MoveIt 规划已生成" if result.plan_valid else "（仅候选可视化，未做 IK/规划）"
         stages = ",".join(str(item) for item in getattr(result, "planned_stages", []) or [])
+        if list(getattr(result, 'planned_stages', [])) == ['OBSERVE']:
+            return dict(success=True, plan_valid=bool(result.plan_valid), recovery_only=True,
+                        stage='OBSERVE_PLANNED', message=error_message or '先移至观察位，再重新规划')
         if candidates <= 0 and "PLACE" in stages:
             # 纯放置计划：本来就没有抓取候选，别报成「没有可用候选」
             return {
@@ -504,6 +532,7 @@ class RosBridge:
                     + ("，MoveIt 规划已生成" if result.plan_valid else "（未做 IK/规划）")
                 ),
                 "stage": "SUCCESS",
+                'plan_valid': bool(result.plan_valid),
             }
         return {
             "success": True,
@@ -511,7 +540,8 @@ class RosBridge:
                 f"远程抓取规划完成：{candidates} 个候选，"
                 f"选中 #{result.selected_index} score={score:.3f}{plan_note}"
                 if candidates
-                else "远程抓取完成，但没有可用候选"
+                else ("几何保底抓取规划完成" if result.plan_valid else "远程抓取完成，但没有可用候选")
             ),
             "stage": "SUCCESS",
+            'plan_valid': bool(result.plan_valid),
         }

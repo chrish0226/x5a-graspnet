@@ -33,7 +33,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="语音抓取"
+                    android:text="腕部抓放"
                     android:textColor="@color/text"
                     android:textSize="26sp"
                     android:textStyle="bold" />
@@ -86,7 +86,7 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_alignParentEnd="true"
-                    android:text="空闲"
+                    android:text="待命"
                     android:textColor="@color/ok"
                     android:textSize="12sp" />
             </RelativeLayout>
@@ -96,7 +96,9 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="正在连接主机"
+                android:text="连接中"
+                android:maxLines="1"
+                android:ellipsize="end"
                 android:textColor="@color/text"
                 android:textSize="22sp"
                 android:textStyle="bold" />
@@ -107,6 +109,9 @@
                 android:layout_height="wrap_content"
                 android:layout_marginTop="6dp"
                 android:text=""
+                android:maxLines="2"
+                android:ellipsize="end"
+                android:visibility="gone"
                 android:textColor="@color/ok"
                 android:textSize="14sp" />
         </LinearLayout>
@@ -182,34 +187,42 @@
             android:orientation="horizontal">
 
             <Button
-                android:id="@+id/btnRed"
+                android:id="@+id/btnPrepare"
                 android:layout_width="0dp"
                 android:layout_height="52dp"
                 android:layout_marginEnd="6dp"
                 android:layout_weight="1"
-                android:backgroundTint="@color/red"
-                android:text="红色"
+                android:backgroundTint="@color/accent"
+                android:text="当前侧准备"
                 android:textColor="@android:color/white" />
 
             <Button
-                android:id="@+id/btnWhite"
-                android:layout_width="0dp"
-                android:layout_height="52dp"
-                android:layout_marginEnd="6dp"
-                android:layout_weight="1"
-                android:backgroundTint="@color/white"
-                android:text="白色"
-                android:textColor="#1A1F2B" />
-
-            <Button
-                android:id="@+id/btnOrange"
+                android:id="@+id/btnPrepareMirror"
                 android:layout_width="0dp"
                 android:layout_height="52dp"
                 android:layout_weight="1"
-                android:backgroundTint="@color/orange"
-                android:text="橙色"
-                android:textColor="#1A1204" />
+                android:backgroundTint="@color/accent"
+                android:text="镜像侧准备"
+                android:textColor="@android:color/white" />
         </LinearLayout>
+
+        <TextView
+            android:id="@+id/observationSideText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="观察方向：当前侧"
+            android:textColor="@color/muted"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/btnHome"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="10dp"
+            android:backgroundTint="@color/accent"
+            android:text="回零位"
+            android:textColor="@android:color/white" />
 
         <Button
             android:id="@+id/btnStop"

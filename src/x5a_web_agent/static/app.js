@@ -45,7 +45,7 @@
     if (msg.type === "status") {
       stageText.textContent = msg.stage_zh || msg.stage;
       stageCode.textContent = msg.stage || "";
-      const terminal = ["SUCCESS", "FAILED", "IDLE", "DRY_RUN"].indexOf(msg.stage) >= 0;
+      const terminal = ["SUCCESS", "FAILED", "IDLE", "DRY_RUN", "READY"].indexOf(msg.stage) >= 0;
       const busy = msg.busy !== false && !terminal;
       busyBadge.textContent = busy ? "忙碌" : "空闲";
       busyBadge.className = `pill ${busy ? "busy" : ""}`;
@@ -122,8 +122,16 @@
     if (state.parsed) parsedEl.textContent = JSON.stringify(state.parsed, null, 2);
     if (state.stage) stageCode.textContent = state.stage;
     if (state.stage_zh) stageText.textContent = state.stage_zh;
-    if (state.holding !== undefined) applyHolding(state.holding, state.held_object);
-    const terminal = ["SUCCESS", "FAILED", "IDLE", "DRY_RUN"].indexOf(state.stage) >= 0;
+    const observationSideBadge = $("observationSideBadge");
+    if (observationSideBadge && state.observation_side) {
+      observationSideBadge.textContent = state.observation_side === "mirror" ? "镜像侧" : "当前侧";
+    }
+    if (state.prepared !== undefined && holdingBadge) {
+      const initialized = state.initialized === undefined ? state.prepared : state.initialized;
+      holdingBadge.textContent = state.prepared ? "已到观察位" : (initialized ? "首次准备已完成" : "尚未准备");
+      holdingBadge.className = `pill ${initialized ? "" : "busy"}`;
+    }
+    const terminal = ["SUCCESS", "FAILED", "IDLE", "DRY_RUN", "READY"].indexOf(state.stage) >= 0;
     const busy = !terminal && (Boolean(state.busy) || state.robot_state === "BUSY");
     busyBadge.textContent = busy ? "忙碌" : "空闲";
     busyBadge.className = `pill ${busy ? "busy" : ""}`;
@@ -358,14 +366,6 @@
     event.preventDefault();
     sendText(textInput.value);
     textInput.value = "";
-  });
-
-  document.querySelectorAll("[data-color]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const color = btn.getAttribute("data-color");
-      transcriptEl.textContent = `手动：${color}`;
-      send({ type: "manual_task", action: "pick_place", target_color: color });
-    });
   });
 
   document.querySelectorAll("[data-command]").forEach((btn) => {

@@ -14,14 +14,17 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
+import time
 from typing import Any, Dict, Optional
 
 from x5a_web_agent.command_parser import ALLOWED_TARGETS, parse_command
+from x5a_web_agent.task_sequence import describe_task
 
 # 任务真的结束了才值得单独打一行结果，ACCEPTED / 各运动阶段只打阶段行。
-RESULT_STAGES = frozenset({"SUCCESS", "FAILED", "DRY_RUN"})
+RESULT_STAGES = frozenset({"SUCCESS", "FAILED", "CANCELED", "DRY_RUN"})
 
 # 结果行前面标出这条结果属于哪个动作：真机链路是异步的，结果可能在你敲下
 # 下一条指令之后才回来，不标一下就像新指令「不动却完成了」。
@@ -30,29 +33,27 @@ ACTION_ZH = {
     "remote_place": "放置",
     "release": "放下",
     "pick_place": "抓放",
+    "prepare": "准备",
     "go_home": "归位",
     "go_ready": "就位",
     "sequence": "序列",
+    "task_sequence": "连续抓放",
+    "pick": "抓起",
+    "place": "放置",
     "cancel": "取消",
 }
 
-HELP_TEXT = """
-终端文字输入层 —— 输入的文字等同于手机语音识别出来的转写结果
-
-  抓起红色方块              直接回车发送，走云端解析 + 抓取链路
-  把笔放到盒子里            多轮后续指令（先抓起来才有意义）
-  停止 / 取消               本地关键词，取消当前任务
-
-  /help, /?                 显示本帮助
-  /state                    打印 agent 当前状态（阶段 / 忙闲 / 手上物体）
-  /cancel                   取消当前任务（等同手机页「停止」）
-  /task <目标>              跳过云端解析，直接发结构化任务
-                            目标: red | white | orange | nearest | farthest
-  /parse <文字>             只用本地规则解析器看 JSON，不发任何任务
-  /quit, /exit, /q          退出终端输入层（agent 进程继续运行）
-
-Ctrl-C 停掉整个 agent 进程；/quit 只关掉这一层输入。
-""".strip()
+HELP_TEXT = """SAM 腕部抓放：
+  准备                    移动到观察位，不抓取
+  回原点 / 归原位 / 返回原位 返回原始收起姿态
+  抓红色方块              抓住后保持夹持，等待放置指令
+  放到白色方块上          放置手里的物体
+  把白色方块放到橙色方块上，然后把红色方块放到白色方块上
+                          按顺序执行，每步重新观察和规划
+  松开夹爪                原地松开，之后重新准备
+  取消                    当前动作结束后停止任务
+  /state /help /cancel /task red /quit
+"""
 
 
 class TerminalBackend:
@@ -93,6 +94,8 @@ class TerminalConsole:
         self._lock = threading.Lock()
         self._last_stage = "IDLE"
         self._last_message = ""
+        self._context = ''
+        self.verbose = os.environ.get('X5A_VERBOSE_TASK_LOGS', '0') == '1'
 
     # ------------------------------------------------------------------ 输出
     def _line(self, tag: str, text: str) -> None:
@@ -100,7 +103,7 @@ class TerminalConsole:
         if not message:
             return
         with self._lock:
-            print(f"[{tag}] {message}", flush=True)
+            print(f"{time.strftime('%H:%M:%S')} {self._context}[{tag}] {message}", flush=True)
 
     def note(self, text: str) -> None:
         self._line("提示", text)
@@ -111,9 +114,10 @@ class TerminalConsole:
     def _message_once(self, tag: str, text: str, label: str = "") -> None:
         """同一句话只打一次：state 里的 last_result 和随后的 result 广播内容相同。"""
         message = str(text or "").strip()
-        if not message or message == self._last_message:
+        key = (self._context, message)
+        if not message or key == self._last_message:
             return
-        self._last_message = message
+        self._last_message = key
         if label:
             message = f"{label}: {message}"
         self._line(tag, message)
@@ -127,19 +131,32 @@ class TerminalConsole:
         action = str(parsed.get("action") or "").strip()
         if not action:
             return ""
-        label = ACTION_ZH.get(action, action)
-        detail = str(parsed.get("prompt") or parsed.get("target_color") or "").strip()
-        return f"{label}「{detail}」" if detail else label
+        return describe_task(parsed)
+
+    def _set_context(self, payload):
+        number = payload.get('command_id')
+        if number is None:
+            return
+        context = f'[任务 {number} · {payload.get("step_index", 1)}/{payload.get("step_total", 1)}] '
+        if context != self._context:
+            self._context = context
+            self._last_stage = ''
+            self._last_message = ''
 
     def on_payload(self, payload: Any) -> None:
         """同时是 hub 广播的观察者，和 HTTP 响应的打印入口。"""
         if not isinstance(payload, dict):
             return
+        self._set_context(payload)
         kind = str(payload.get("type") or "").strip()
         if kind == "transcript":
             return  # 就是刚刚敲进去的那句话，不用回显
         if kind == "parsed":
+            self._context = ''
             self._print_parsed(payload.get("result"))
+            return
+        if kind == 'step':
+            self._line('步骤', str(payload.get('message') or ''))
             return
         label = self._payload_label(payload)
         if payload.get("message"):
@@ -149,7 +166,18 @@ class TerminalConsole:
                 tag = "结果"
             else:
                 tag = "提示"
-            self._message_once(tag, str(payload.get("message")), label)
+            message = str(payload.get('message'))
+            if kind == 'result':
+                duration = payload.get('duration_s')
+                planning = payload.get('planning_s')
+                if duration is not None:
+                    message += (f'（规划 {planning:.1f}s / 本步 {duration:.1f}s）'
+                                if planning is not None else f'（总耗时 {duration:.1f}s）')
+                if payload.get('holding') is True:
+                    message += '；仍在持物'
+                elif payload.get('holding') is False:
+                    message += '；夹爪已释放'
+            self._message_once(tag, message, label if kind != 'result' and not self._context else '')
         stage = str(payload.get("stage") or "").strip()
         if stage:
             self._print_stage(stage, payload)
@@ -158,6 +186,7 @@ class TerminalConsole:
         """轮询 /api/state 拿到的快照（没有 type 字段）。"""
         if not isinstance(state, dict):
             return
+        self._set_context(state)
         if state.get("message") or state.get("type"):
             self.on_payload(state)
             return
@@ -168,14 +197,19 @@ class TerminalConsole:
             self.print_state(state)
 
     def _print_stage(self, stage: str, payload: Dict[str, Any]) -> None:
+        if stage == 'CANDIDATE_REJECT' and not self.verbose:
+            return  # per-candidate diagnostics are retained in backend logs
         if stage == self._last_stage:
             return
         self._last_stage = stage
-        self._line("阶段", str(payload.get("stage_zh") or stage))
+        if stage not in RESULT_STAGES:
+            elapsed = payload.get('elapsed_s')
+            suffix = f'（+{elapsed:.1f}s）' if elapsed is not None else ''
+            self._line("阶段", str(payload.get("stage_zh") or stage)+suffix)
         if stage not in RESULT_STAGES:
             return
         result = payload.get("last_result")
-        if isinstance(result, dict):
+        if isinstance(result, dict) and not payload.get('busy'):
             self._message_once(
                 "结果", str(result.get("message") or ""), self._payload_label(payload)
             )
@@ -183,7 +217,16 @@ class TerminalConsole:
     def _print_parsed(self, parsed: Any) -> None:
         if not isinstance(parsed, dict):
             return
-        self._line("解析", json.dumps(parsed, ensure_ascii=False, sort_keys=True))
+        if parsed.get('action') in ('sequence', 'task_sequence'):
+            tasks = parsed.get('tasks', [])
+            self._line('解析', f'连续任务，共 {len(tasks)} 步')
+            for index, task in enumerate(tasks, 1):
+                self._line('计划', f'{index}. {describe_task(task)}')
+        else:
+            self._line('解析', describe_task(parsed) if parsed.get('action') != 'unknown'
+                       else str(parsed.get('message') or '无法理解指令'))
+        if self.verbose:
+            self._line('解析详情', json.dumps(parsed, ensure_ascii=False, sort_keys=True))
 
     def print_state(self, state: Dict[str, Any]) -> None:
         if not isinstance(state, dict) or not state:
@@ -196,7 +239,7 @@ class TerminalConsole:
             held_text = "空"
         self._line(
             "状态",
-            "阶段={stage} 忙={busy} 手上={held} task_server={server} 后端={backend}".format(
+            "阶段={stage} 忙={busy} 手上={held} 规划/执行服务={server}".format(
                 stage=state.get("stage_zh") or state.get("stage") or "?",
                 busy="是" if state.get("busy") else "否",
                 held=held_text,

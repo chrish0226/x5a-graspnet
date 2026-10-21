@@ -1,314 +1,241 @@
-# ARX X5A ROS 2 视觉抓取放置系统
+# X5A 腕部 RGB-D 语言抓取与放置
 
-稳定抓取路径是 **Python `x5a_pick_place`**，不要用 `./x5a_pick.sh`（那是实验性 MTC）。
+面向 **ARX X5A 单臂、原厂平行夹爪、腕部 Orbbec Gemini 345Lg、ROS 2 Humble / MoveIt 2** 的工程工作区。主要流程为 **SAM 文本分割 → 本地深度筛选 → GraspNet 抓取候选 → TRAC-IK / MoveIt 规划 → 独立执行器**。另保留本地颜色方块抓放。
 
-## 手机 / QQ 语音抓取 Demo
+本分支整理自 `wrist_ws`，与原固定相机工程使用不同的手眼模型和命名空间。不要混用两套工作区的外参和构建产物。
 
-机械臂主机没有麦克风。推荐用安卓 App 录音，主机用本地 `faster-whisper` 识别，再经 `/x5a/pick_place` 调用现有视觉抓取。不绕过 MoveIt，也不额外发布 `/arm_cmd`。
+> **验证状态（2026-10-17）：** 已有实机抓放记录，但复杂叠放仍会失败。最新方块换面通过部分保存场景的离线规划，尚未实机验收。配置是本机实验配置，标定的严格 3 mm 验收仍为 FAIL。尚无统一场景、足够样本的抓取成功率统计。
 
-支持：
+## 功能与入口
 
-- 红 / 白 / 橙
-- 「把最近的 / 最远的放入盒子」
-- 「把红色和白色放入盒子」（队列连续抓，中间回 Ready，盒子坐标只冻结一次）
-- QQ 群 OneBot 机器人（Napcat / Lagrange）
+| 项目 | SAM 腕部模式 | 本地颜色模式 |
+| --- | --- | --- |
+| 定位 | 云端 SAM 文本分割 + 本地深度 | HSV 红 / 白 / 橙方块及盒沿 |
+| 抓姿 | GraspNet 原生候选 + 经检查的几何备用姿态 | 本地方块策略 |
+| 求解与规划 | TRAC-IK Speed、4 个 IK worker、OMPL RRTConnect | 默认 KDL、MoveIt |
+| 交互 | 分开抓放、整句抓放、多步骤队列 | 持物与代词承接、最多三层叠放、8 步队列、观察侧及逐层清障记忆 |
+| 启动 | `bash scripts/start_sam.sh` | `bash scripts/start.sh` |
+| 不执行动作的检查 | `bash scripts/start_sam.sh --plan-only`：推理与规划 | `bash scripts/start.sh --dry-run`：仅交互，不规划 |
+| 页面 | HTTP 8000 / HTTPS 8443 | HTTP 8001 / HTTPS 8444，另提供旧端口兼容 |
 
-安卓 APK：`android/X5A语音抓取.apk`（自动连接 `192.168.0.50:8000`）
+颜色流程已增加口语同义词、三色顺序收纳、持物/识别查询、三层叠放及按顶层顺序清障、叠放四方向搜索，并优化速度、预抓取候选和 5 mm 桌面碰撞余量，详见[颜色优化与指令示例](docs/COLOR_WORKFLOW.md#2026-10-20-速度与容差优化)。
 
-完整说明：[docs/VOICE_INTERACTION.md](docs/VOICE_INTERACTION.md)。
+两种模式共用进程锁，不能同时控制机械臂。SAM 没有移植颜色流程中的镜像准备、自动清障和叠放记忆。详见 [SAM 说明](docs/SAM_WRIST.md)、[颜色流程](docs/COLOR_WORKFLOW.md)。
 
-### 终端文字输入层（测试用，不用麦克风）
+## 系统流程
 
-不想说话/没有手机时，直接用键盘打字，走的是和语音完全相同的那条链路（只替换「语音转文字」这一步）：
-
-```bash
-./scripts/text_cli.sh                      # 接入已经在跑的 web_agent（默认 127.0.0.1:8000）
-./scripts/text_cli.sh --url http://192.168.0.50:8000
-
-# 或者把输入层塞进 web_agent 进程本身（要先停掉已有的 web_agent）
-ros2 run x5a_web_agent web_agent --host 0.0.0.0 --port 8000 --terminal
-./run_x5a_voice_demo.sh --terminal
+```mermaid
+flowchart LR
+    A[文字 / 手机录音] --> B[本地 SenseVoice 转写]
+    B --> C[指令分步 + 云端语义解析]
+    A --> C
+    C --> D[同步 RGB-D + 曝光时刻 TF]
+    D --> E[SAM 掩码 + 本地深度筛选]
+    E --> F[GraspNet 抓取候选]
+    F --> G[几何检查 + TRAC-IK + MoveIt]
+    G --> H[完整阶段计划]
+    H --> I[独立执行器 / 轨迹适配器]
+    I --> J[厂商 SDK / CAN / 机械臂]
 ```
 
-新开的终端一定要先 source 环境（或直接用 `scripts/text_cli.sh`，它自己会 source）：
-`source /opt/ros/humble/setup.bash && source ~/arx/arm/install/setup.bash`，否则会报 `Package 'x5a_web_agent' not found`。
+SAM 决定目标像素，GraspNet 预测候选抓姿，MoveIt 对应用给定的目标进行求解与避障。模型分数高不代表可达；换抓取面、换放置面、候选排序和失败恢复需要应用明确实现。
 
-`/help` 看命令（`/state`、`/cancel`、`/task red`、`/parse <文字>`、`/quit`）。真机模式下打进去的文字会真的动机械臂；只想看解析就用层里的 `/parse`。
+## 安装
 
-## 一键视觉抓取
+### 1. 环境和外部依赖
 
-机械臂、RealSense、CANable2 正确连接后：
-
-```bash
-cd ~/arx/arm
-./run_x5a_vision_pick.sh --color red
-```
+已验证主机为 Ubuntu 22.04、x86_64、ROS 2 Humble。先安装 ROS 2，再安装构建与运行依赖，例如：
 
 ```bash
-./run_x5a_vision_pick.sh --color white
-./run_x5a_vision_pick.sh --color orange
-./run_x5a_vision_pick.sh --vision-only
-./run_x5a_vision_pick.sh --dry-run --color red
+sudo apt install git build-essential python3-colcon-common-extensions python3-rosdep \
+  python3-pytest python3-numpy python3-scipy python3-opencv python3-yaml \
+  python3-fastapi python3-uvicorn python3-multipart python3-requests \
+  python3-paho-mqtt python3-pil python3-wsproto python3-pip curl openssl libssl-dev \
+  ros-humble-moveit ros-humble-cv-bridge ros-humble-tf2-geometry-msgs \
+  ros-humble-realsense2-camera
 ```
 
-脚本会 source ROS/厂商/项目环境，复用健康的既有节点，并检查 CAN、关节反馈、MoveIt、RealSense、Eye-to-Hand TF 和稳定视觉坐标。默认执行一次抓放后回 Home。日志在 `logs/run_YYYYMMDD_HHMMSS/`。
+`realsense2_camera` 用于兼容包依赖，腕部实际使用 Orbbec。需另装匹配的 `orbbec_camera`，确认存在 `launch/gemini345_lg.launch.py`。
 
-前三步（控制器、MoveIt、视觉）已经在跑时，直接：
+按 [ARX_X5 官方工程](https://github.com/ARXroboticsX/ARX_X5) 编译 `ROS2/X5_ws`，提供 `arx5_arm_msg`、厂商头文件及 `libarx_x5_src.so`。完整 SDK、相机驱动、模型权重和 CUDA 算子不包含在仓库内。
 
-```bash
-source /opt/ros/humble/setup.bash
-source ~/arx/arm/install/setup.bash
-ros2 launch x5a_pick_place pick_place.launch.py \
-  plan_only:=false vision_enabled:=true target_color:=red
-```
-
-## 项目简介
-
-这是一个在真实 ARX X5A 上运行的 ROS 2 Humble 项目，使用 MoveIt 2、Intel RealSense RGB-D 和 Eye-to-Hand 手眼标定，实现视觉定位、抓取、放到黑色海绵目标并回 Home。
-
-换相机位置后已用 2026-08-13 标定重新闭环。当前正式链：
+**腕部驱动兼容层只支持已校验的 x86_64 SDK ABI**。构建和运行均校验 SDK SHA-256：
 
 ```text
-EYE-TO-HAND CALIBRATION: PASS
-VISION PICK AND PLACE: PASS
+d07d53d14da17f0a1db2753e3339f9e4c055dad72df613c811b9692c4bede85c
 ```
 
-## 已实现功能
+不同 SDK 需重新核验兼容层；不能通过删除哈希检查解决兼容问题。实现见 [驱动目录](src/x5a_wrist_driver)。
 
-- X5A `robot_description`、URDF/Xacro 和 mesh
-- MoveIt 2 OMPL planning、Planning Scene 和真机 ExecuteTrajectory
-- `RobotStatus` → `/joint_states` 状态反馈
-- `FollowJointTrajectory` → ARX `RobotCmd` 正式适配器
-- 标准 `control_msgs/action/GripperCommand` 夹爪控制
-- 视觉坐标冻结后按预抓取姿态 → 接近 → 抓取 → 短抬起 → 放置 → 回 Home
-- 抓取使用已验证的近竖直姿态；放置会尝试多组朝向和多种子 IK
-- ChArUco Eye-to-Hand 标定与 `base_link -> camera_link` TF 发布
-- RealSense aligned RGB-D 红、白、橙三色方块独立定位
-- 黑色海绵区域中心作为可移动放置目标
-- 工作区包络过滤，避免把不可达点交给规划器
+### 2. 获取腕部版本
 
-## 系统架构
+```bash
+mkdir -p ~/arx
+git clone --branch wrist-sam https://github.com/chrish0226/x5a-graspnet.git ~/arx/wrist_ws
+cd ~/arx/wrist_ws
+```
 
-正式真机执行链：
+### 3. 修改本机配置
+
+仓库保留原实机参数。换用户、目录、机械臂或相机时，构建前核对：
+
+| 文件 | 必须核对的内容 |
+| --- | --- |
+| `scripts/env.bash` | ROS / 厂商 overlay；默认厂商路径 `/home/quella/repos/arx/ARX_X5/ROS2/X5_ws` |
+| `src/x5a_wrist_driver/CMakeLists.txt` | `VENDOR_ROOT`、`SDK` 路径及 SDK ABI |
+| `scripts/start_sam.sh` | 私有密钥文件路径，默认 `/home/quella/.config/x5a_remote_grasp/key.env` |
+| `config/calibration/handeye_model_candidate.yaml` | `robot_calibration.candidate_urdf` 改为本克隆中的 URDF；外参只适用原安装 |
+| `config/task_plan.yaml`、`config/task_execute.yaml` | 标定结果路径、观察位和允许关节范围 |
+| `config/sam_grasp.yaml` | 模型服务地址、抓帧目录、工作空间、桌面与相机模型、准备位 |
+| `config/driver.yaml` | CAN 接口，原机为 `can1`；按厂商方式预先配置 CAN |
+| `src/x5a_handeye/launch/eye_in_hand.launch.py` | 相机序列号和驱动入口 |
+
+`/home/quella/arx/wrist_ws` 是原工作区的绝对路径，换目录必须更新。`reachability_table` 指向未提供的离线表，不应视为已标定的可达性数据。原始标定图像未上传；保存的验证报告不能替代新安装上的重新标定。
+
+### 4. 构建和语音模型
+
+```bash
+source scripts/env.bash
+rosdep install --from-paths src --ignore-src -r -y
+bash scripts/setup_trac_ik.bash
+bash scripts/build.sh
+source scripts/env.bash
+```
+
+TRAC-IK 脚本下载固定提交、应用 Humble 补丁，在 `.deps/trac_ik_ws` 内构建，不替换系统插件。需要网络和可用 apt 索引。使用 `/usr/bin/python3`，避免 Conda 环境混入 ROS。
+
+手机语音另需安装 ASR；仅用文字可跳过：
+
+```bash
+bash scripts/install_asr.sh
+```
+
+它下载 SenseVoiceSmall ONNX INT8，把固定版本 sherpa-onnx 安装到 `vendor/asr/`，不替换 ROS NumPy。
+
+### 5. 云端模型和密钥
+
+SAM、GraspNet、Ollama 在 GPU 服务器运行，部署和接口见 [server/README.md](server/README.md)。使用现有部署时，确认健康状态并配置自己的服务地址。
+
+客户端通过 `SAM_GRASPNET_API_KEY` 读取密钥。可在启动脚本指定的私有 `key.env` 中设置：
+
+```bash
+export SAM_GRASPNET_API_KEY='<替换为服务密钥：64 位十六进制>'
+```
+
+解析地址由 `X5A_CLOUD_PARSE_URL` 控制；迁移服务器时需同时修改它和 `config/sam_grasp.yaml` 的 `remote.base_url`：
+
+```bash
+export X5A_CLOUD_PARSE_URL='http://<模型服务器>:8300/parse'
+```
+
+配置里的 IP 是原部署地址，不是随克隆提供的公共服务。密钥、证书私钥和模型权重均未上传。
+
+## 启动和使用
+
+确认原 SAM/颜色启动终端已退出，CAN、相机正常后运行：
+
+```bash
+cd ~/arx/wrist_ws
+bash scripts/start_sam.sh
+```
+
+默认启动只提供服务，收到指令后才运动。手机访问 `http://<机械臂主机IP>:8000`；按住录音使用 `https://<机械臂主机IP>:8443`，首次需接受本机证书并允许麦克风。横幅中的 `192.168.0.50` 是原主机地址，按实际 IP 访问。
+
+独立文字终端：
+
+```bash
+cd ~/arx/wrist_ws
+bash scripts/text_sam.sh
+```
+
+典型指令：
 
 ```text
-RealSense
-   |
-   v
-x5a_vision -- selected cube pose + /x5a_vision/box_pose
-   |
-   v
-TF2 / Eye-to-Hand
-   |
-   v
-x5a_pick_place
-   |
-   v
-MoveIt 2 ExecuteTrajectory
-   |
-   v
-FollowJointTrajectory + GripperCommand
-   |
-   v
-x5a_moveit_official_adapter
-   |
-   v
-ARX /arm_cmd (RobotCmd)
-   |
-   v
-official X5Controller -> CAN -> X5A
+准备
+抓红色方块
+放到白色方块上
+把白色方块放到橙色方块上，然后把红色方块放到白色方块上
+把瓶子放进盒子里
+回零
 ```
 
-反馈链：
+“抓起后另行指定放置”保留持物状态；队列逐步解析、观察、规划和执行，任一步失败即停止。SAM 目前只配置当前侧观察位。回零、松爪和停止应结合当前持物状态操作。
+
+- `bash scripts/start_sam.sh --plan-only`：推理与规划，准备、回零、抓取、松爪均不执行。
+- `bash scripts/start_sam.sh --verbose`：终端展开完整底层日志。
+- `bash scripts/stop_sam.sh --check`：只检查当前工作区的相关进程。
+- `bash scripts/stop_sam.sh` 或启动终端 `Ctrl+C`：结束本地程序，不停止云端服务。
+
+终端显示任务编号、步骤、阶段、耗时与持物状态；底层日志在 ROS 日志目录（默认 `~/.ros/log/`）。重复的 `MULTI DETECTION` 已降为 DEBUG。网页取消和程序退出不等同硬件急停。持物几何主要在进程内维护，持物时重启后不能假定新进程自动恢复原状态。
+
+## 当前规划与优化
+
+**每一步先规划完整阶段，再执行。** 单抓为 `PREGRASP → GRASP → LIFT → RETREAT`；整句抓放为六段，含 `TRANSPORT / PLACE`；持物纯放置为 `TRANSPORT → PLACE → RETREAT`。多步骤队列逐步规划，不在开局一次计算整条队列。
+
+| 项目 | 当前配置 / 行为 |
+| --- | --- |
+| IK / 规划器 | TRAC-IK Speed / OMPL RRTConnect；另加载 Pilz、CHOMP，切换仍需验证 |
+| 候选规划预算 | `planning.total_budget_s: 8.0`；不包含全部采图、语义解析、网络和执行时间，也不是整个请求的硬超时 |
+| 超时后重新观察 | 空手抓取耗尽规划预算时，可尝试一次独立完整的 OBSERVE 路径，靠近约 3–6 cm，再取新图规划；持物纯放置不适用 |
+| 前缀复用 | 同一次观测内复用已检查的阶段前缀；新观测重新计算 |
+| 接近 / 放置 | 笛卡尔路径完成比例至少 0.9999，并核对 FK 终点；不执行失败计划的残缺片段 |
+| 静态执行 | `grasp.pre_execution_visual_recheck: false`，执行前不再调用 SAM；保留指纹、时效、反馈和执行状态检查 |
+| 桌面接触 | 仅两指 `link7/8` 有 5 mm 模型接触容差，下方另设边界；本体、腕部和相机仍检查碰撞 |
+| 方块对齐 | 支撑中心、夹持偏移和顶面边方向；叠放中心偏移限约 3 mm，释放间隙尝试 10–20 mm |
+| 方块换面 | 可信的约 20–55 mm 小立方体枚举最多 24 种面/边等价姿态，各自重新检查完整路径；其他物体保留原朝向约束 |
+| 平滑松爪 | 约 0.65 s 渐开，再保持/验证约 0.8 s |
+| 精度容忍 | 额外 TCP 误差为提示；小关节最终残差在有响应且稳定后可按 0.06 rad 容差继续；硬范围、跟踪和反馈保护仍有效 |
+
+当前 `gripper.model_path` 为空，使用原厂 URDF/CAD 碰撞网格和原简化接触参数。[共享夹爪模型](models/README.md)是保留但关闭的实验选项。
+
+## 验证和限制
+
+与本分支相关的回归命令，使用独立 DDS 域：
+
+```bash
+source scripts/env.bash
+X5A_TEST_ROS_DOMAIN_ID=157 /usr/bin/python3 -m pytest -q \
+  src/x5a_remote_grasp/test src/x5a_web_agent/test src/x5a_pick_place/test tests \
+  src/x5a_vision/test src/x5a_handeye/test --disable-warnings
+```
+
+2026-10-21 颜色三层叠放扩展后的完整回归 **742 项通过**。`conftest.py` 从 `X5A_TEST_ROS_DOMAIN_ID` 设置测试域，仅设置 `ROS_DOMAIN_ID` 会被覆盖。保存场景回放、性能测量及实机验证边界见 [验证记录](docs/VALIDATION.md)。
+
+- 标定留出集最大误差约 4.7 mm，严格 3 mm 验收失败；棱角对齐尚无高精度实机堆叠保证。
+- SAM 持物点云尚未作为完整附着碰撞体覆盖所有运动阶段，其他物体的场景建模也不完整。完整轨迹不代表所有物体与环境接触都已验证。
+- 静态执行要求物品保持静止；遮挡、透明/反光物体、缺深度和未观测障碍仍可能导致失败。
+- 分开抓放时，当前抓姿未必适合后续放置；24 姿态枚举不能解决所有碰撞与臂展问题。
+- 持物判断主要依赖夹爪开度/反馈，不是力或视觉闭环证明；薄长工具、空抓和滑落仍需验证。
+- 云端可能误解析 box/cube、颜色或关系；先核对解析、掩码和错误阶段，再区分感知、IK、碰撞与执行问题。
+
+## 目录
 
 ```text
-X5A -> CAN -> X5Controller -> /arm_status (RobotStatus)
-    -> x5a_moveit_official_adapter -> /joint_states -> MoveIt / RViz
+config/                         本机参数、标定候选、TRAC-IK 补丁
+scripts/                        构建、启停、文字输入、只读检查
+src/x5a_remote_grasp/           云端接口、几何筛选、规划、独立执行器
+src/x5a_parallel_ik/            同模型的独立 IK worker
+src/x5a_wrist_driver/           经过 SDK ABI 校验的腕部驱动
+src/x5a_moveit_official_adapter/  MoveIt 轨迹适配
+src/x5a_web_agent/              手机页面、语音、队列和日志
+src/x5a_handeye/                标定、模型检查和腕部 TF
+src/x5a_vision/                 RGB-D、颜色检测、顶面/盒沿
+src/X5A/                       机器人描述和必要网格
+server/                        SAM、语义网关、GraspNet 服务源码
+android/                       可选原生手机端源码
+models/                        模型说明和未启用的夹爪实验资源
+docs/                          使用、验证和第三方说明
+tests/                         跨模块回归
 ```
 
-`x5a_control_bridge` 是项目早期 bridge/测试实现，保留用于历史和实验参考。稳定版真机运行必须使用 `x5a_moveit_official_adapter`，禁止两个 bridge/adapter 同时运行；`/arm_cmd` publisher count 必须严格等于 1。
+`.gitignore` 排除构建目录、日志、原始标定数据、模型权重、APK、密钥、私有环境文件和本地报告备份。Android 需自行编译，仓库不提供原设备签名和 APK 下载服务。
 
-## 软件环境
+## 参考与许可
 
-- Ubuntu 22.04.5 LTS (x86_64)
-- ROS 2 Humble
-- MoveIt 2.5.9
-- Intel RealSense D435i，librealsense 2.58.2
-- `realsense2_camera` 4.58.2
-- OpenCV / `cv_bridge` 3.2.1
-- Python 3.10（ROS 2 Humble 系统 Python）
+- [GraspNet Baseline](https://github.com/graspnet/graspnet-baseline)：RGB-D 候选抓姿与碰撞筛选。
+- [SAM 3](https://github.com/facebookresearch/sam3)：文本提示分割上游；当前服务适配已部署的 SAM 3.1 multiplex checkpoint，需匹配模型/API 版本。
+- [TRAC-IK](https://github.com/traclabs/trac_ik)：IK 插件，固定提交和补丁见安装脚本。
+- [MoveIt Planning Scene](https://moveit.picknik.ai/humble/doc/examples/planning_scene/planning_scene_tutorial.html)：碰撞场景和接触策略。
+- [公开路线调研](docs/TABLETOP_ROBOT_ROUTES_20261016.md)、[第三方依赖](docs/THIRD_PARTY.md)。
 
-## ROS 2 packages
-
-| Package | 用途 |
-|---|---|
-| `X5A` | 厂商 X5A description/mesh 与本项目 MoveIt TCP wrapper |
-| `x5a_moveit_config` | MoveIt 2 模型、规划参数、控制器映射、真机 bringup |
-| `x5a_moveit_official_adapter` | `/arm_status` 状态适配，FJT/Gripper action 到官方 `/arm_cmd` |
-| `x5a_pick_place` | **正式**视觉/固定坐标抓放状态机 |
-| `x5a_task_server` | 长期运行的 `/x5a/pick_place` Action，复用 `x5a_pick_place` |
-| `x5a_web_agent` | 手机网页、语音文字、规则解析、Action Client |
-| `x5a_vision` | HSV + RGB-D + TF2 的红/白/橙方块及黑色海绵中心定位 |
-| `x5a_remote_grasp` | 远程 SAM 3.1 + GraspNet 候选、TF/RViz/IK/MoveIt 纯规划 |
-| `x5a_handeye` | ChArUco 检测、采样、Eye-to-Hand 求解、验证与 TF 发布 |
-| `x5a_mtc_pick_place` | 实验性 MTC 整链规划；日常抓取不要用 |
-| `x5a_task_interfaces` | MTC 的 `PickPlace` 以及语音链路的 `X5aPickPlace` action |
-| `x5a_control_bridge` | 早期实验 bridge；稳定真机链不启动 |
-
-厂商 `arx5_arm_msg`、`arx_x5_controller` 和 SDK 保持为外部依赖，详情见 [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)。
-
-## 获取依赖与编译
-
-先安装 ROS 2 Humble、MoveIt 2、RealSense ROS wrapper 和 OpenCV ROS packages，并按厂商文档准备 ARX 工作区：
-
-```bash
-git clone https://github.com/ARXroboticsX/ARX_X5.git ~/repos/arx/ARX_X5
-cd ~/repos/arx/ARX_X5/ROS2/X5_ws
-source /opt/ros/humble/setup.bash
-colcon build
-```
-
-克隆本项目并编译：
-
-```bash
-git clone https://github.com/wangfengnan521/arm.git ~/arx/arm
-cd ~/arx/arm
-source /opt/ros/humble/setup.bash
-source ~/repos/arx/ARX_X5/ROS2/X5_ws/install/setup.bash
-colcon build --symlink-install
-source install/setup.bash
-```
-
-## CAN
-
-真机验证使用 CANable2、slcan、`can1`、1 Mbps（`slcand -s8`）。设备 udev alias 为 `/dev/arxcan1` 时：
-
-```bash
-cd ~/arx/arm
-./scripts/setup_can_x5a.sh
-```
-
-脚本不会保存 sudo 密码，并会拒绝为同一接口启动第二个 `slcand`。启动后应看到 `can1` 为 `UP`、`ERROR-ACTIVE`。不要运行多个 `slcand` 或看门狗循环。
-
-## 启动
-
-以下命令分别在独立终端运行。真实运动前确认工作区无人、急停可用、CAN 正常，并确保只有一个 `X5Controller` 和一个正式适配器。
-
-### 1. 官方 X5A 控制器
-
-```bash
-source /opt/ros/humble/setup.bash
-source ~/repos/arx/ARX_X5/ROS2/X5_ws/install/setup.bash
-ros2 launch arx_x5_controller open_single_arm.launch.py
-```
-
-### 2. X5A + MoveIt + RViz
-
-```bash
-source /opt/ros/humble/setup.bash
-source ~/repos/arx/ARX_X5/ROS2/X5_ws/install/setup.bash
-source ~/arx/arm/install/setup.bash
-ros2 launch x5a_moveit_config x5a_real_moveit.launch.py \
-  start_driver:=false start_adapter:=true use_rviz:=true
-```
-
-也可以由该 launch 启动官方 driver，此时必须保证外部 `X5Controller` 未运行，并使用 `start_driver:=true`。
-
-### 3. RealSense / Eye-to-Hand TF / Vision
-
-```bash
-source /opt/ros/humble/setup.bash
-source ~/arx/arm/install/setup.bash
-ros2 launch x5a_vision vision.launch.py start_camera:=true
-```
-
-若相机已经运行，使用 `start_camera:=false`，不要启动第二个 RealSense 节点。
-
-### 4. Pick & Place
-
-先只规划：
-
-```bash
-ros2 launch x5a_pick_place pick_place.launch.py \
-  plan_only:=true vision_enabled:=true target_color:=red
-```
-
-确认 `/arm_cmd` publisher count 为 1、现场安全检查完成后真机执行：
-
-```bash
-ros2 launch x5a_pick_place pick_place.launch.py \
-  plan_only:=false vision_enabled:=true target_color:=red
-```
-
-启动日志应出现 `HANDEYE ... manual_samples_recalib_20260813b.json`。正式链禁止直接发布 `/arm_cmd`、禁止同时启动 `x5a_control_bridge`、禁止绕过 MoveIt 插值关节轨迹。
-
-## Eye-to-Hand calibration
-
-当前实机标定从 `src/x5a_handeye/config/handeye_result.yaml` 读取（换相机位置后于 2026-08-13 重标）：
-
-- Board：ChArUco，`DICT_4X4_50`，5 x 7；square 0.020 m；marker 0.014 m
-- Solver：PARK
-- 样本：`src/x5a_handeye/data/manual_samples_recalib_20260813b.json`（28 组，用了 22）
-- 训练均值 / 最大：5.12 mm / 11.22 mm
-- Hold-out 均值 / 最大：4.18 mm / 5.47 mm
-- 变换：`T_base_camera_color_optical`
-- 标定 verdict：PASS
-
-运行时只额外发布 `base_link -> camera_link`；RealSense 自己发布 `camera_link -> ... -> camera_color_optical_frame`。禁止给光学系再挂第二个 parent。改过 `handeye_result.yaml` 后必须重启 `vision.launch.py`，因为 install 里的 yaml 在非 symlink 情况下不会自动更新。
-
-相机或支架移动后必须重标。重力采样（先停 adapter / pick_place，保证 `/arm_cmd` publisher 为 0）：
-
-```bash
-# 终端 1：重力模式，按 g 拖动，h 锁住
-source /opt/ros/humble/setup.bash
-source ~/repos/arx/ARX_X5/ROS2/X5_ws/install/setup.bash
-source ~/arx/arm/install/setup.bash
-ros2 run x5a_handeye gravity_teach
-```
-
-```bash
-# 终端 2：检测板 + 采样（新文件，不要和旧批次混）
-cd ~/arx/arm
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-bash src/x5a_handeye/scripts/standard_handeye_pipeline.sh start_prereq
-SAMPLES="$PWD/src/x5a_handeye/data/manual_samples_recalib_YYYYMMDD.json" \
-  bash src/x5a_handeye/scripts/standard_handeye_pipeline.sh sample
-SAMPLES="$PWD/src/x5a_handeye/data/manual_samples_recalib_YYYYMMDD.json" \
-  bash src/x5a_handeye/scripts/standard_handeye_pipeline.sh solve
-```
-
-求解须 `verdict: PASS` 后再重启视觉。标定板夹死、每点停稳再按 `s`，并覆盖工作区 X/Y 与多种板朝向。
-
-## Visual Pick & Place
-
-15 帧 median/std 过滤；方块和海绵中心同时冻结，本轮不再跟视觉漂移。流程：
-
-1. `MOVE_READY`：`joint1 = atan2(y, x)`，其余用 `pre_grasp_ready_joints`
-2. 预抓取位，接近/接触/短抬起保持同一抓取姿态（默认 RPY `[0, 1.45, 0]`）
-3. 放置尝试多组朝向和多种子 IK
-4. 松开、后退、回 Home
-
-当前速度缩放（`pick_place.yaml`）：transit `0.75 / 0.38`，接近放下 `0.28 / 0.16`，抬起后退 `0.35 / 0.20`。适配器关节速度上限仍是 `1.0 rad/s`。
-
-## 参数修改
-
-- 物块尺寸、HSV、深度和 workspace：`src/x5a_vision/config/vision.yaml`
-- 抓取 offset、物块尺寸、table、place pose、速度：`src/x5a_pick_place/config/pick_place.yaml`
-- FollowJointTrajectory/夹爪适配器频率与保护：`src/x5a_moveit_official_adapter/config/adapter.yaml`
-- 手眼外参：`src/x5a_handeye/config/handeye_result.yaml`
-- ChArUco board：`src/x5a_handeye/config/board.yaml`
-- MoveIt joint limits/kinematics/controller：`src/x5a_moveit_config/config/`
-
-当前实机验证的抓取 `z_offset` 为 0.040 m。除非有标定证据，不应通过修改手眼 TF 凑抓取结果。
-
-## 已知限制
-
-- 检测器针对已知 HSV 的小方块，不是通用物体识别。
-- `tool0` 是标定和规划使用的 TCP。
-- joint limits 来自 X5 软件限位和本机实测，不是完整机械范围认证。`joint4` 主动伺服下限约 `-1.28 rad`。
-- 正式桥是项目实现的 FJT / Gripper 到 ARX `RobotCmd` 适配器，不是完整 `ros2_control` HardwareInterface。
-- 视觉工作区约 `x∈[0.08,0.41]`、`y∈[0.08,0.48]`、`r≤0.54 m`。更远的近竖直抓取会受臂长和 `joint4` 限制。
-- `x5a_mtc_pick_place` 仍是实验包；整链 MTC 在远放置点上不如 Python 状态机稳定。
-- 相机 serial 写在 `x5a_vision/launch/vision.launch.py`；换相机要改参数。
-- 真机必须有熟悉机械臂、CAN 和急停的人现场监护。
+沿用 [BSD-3-Clause](LICENSE)，保留原工程及厂商版权声明。外部 SDK、模型和依赖遵循各自许可。

@@ -1,0 +1,12 @@
+# One bounded, ordered colour programme; the server owns the whole queue.
+# A destination is box, hold, red, white or orange.
+string[] source_colors
+string[] destination_colors
+---
+bool success
+string message
+uint32 completed_steps
+---
+uint32 step_index
+uint32 step_total
+string stage

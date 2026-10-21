@@ -1546,3 +1546,38 @@ def test_named_place_api_preserves_expected_source_and_rejects_mismatch(monkeypa
         assert result.status_code == 409
         assert not fake.calls and web._job is None
     asyncio.run(run())
+
+
+def test_observed_implicit_repick_utterance_dispatches_one_program(monkeypatch):
+    web,fake=web_fixture(monkeypatch)
+    fake.prepared=True
+    fake.send_task_sequence=Mock(return_value={'success':True,'message':'完成','completed_steps':2})
+    async def run():
+        invalid='把白色方块放到红色方块上，再把它放到蓝色方块上。'
+        valid='把白色方块放到红色方块上，再把它放到橙色方块上。'
+        assert not (await web.handle_text(invalid))['ok']
+        fake.send_task_sequence.assert_not_called()
+        assert (await web.handle_text(valid))['ok']
+        await web._job
+        fake.send_task_sequence.assert_called_once()
+        assert fake.send_task_sequence.call_args.args[0] == [
+            {'action':'pick_place','target_color':'white','destination_color':'red'},
+            {'action':'pick_place','target_color':'white','destination_color':'orange'}]
+        history=web.state['command_history']
+        assert [entry['text'] for entry in history] == [invalid,valid]
+        assert history[0]['parsed']['action'] == 'unknown' and not history[0]['reply']['ok']
+        assert history[1]['parsed']['action'] == 'task_sequence' and history[1]['reply']['ok']
+    asyncio.run(run())
+
+
+def test_recent_utterances_are_bounded_and_never_store_audio(monkeypatch):
+    web,fake=web_fixture(monkeypatch)
+    async def run():
+        for _ in range(23):
+            assert (await web.handle_text('帮助'))['ok']
+        history=web.state['command_history']
+        assert len(history) == 20
+        assert [entry['number'] for entry in history] == list(range(4,24))
+        assert all(set(entry)=={'number','text','parsed','reply'} for entry in history)
+        assert fake.calls == [] and web._job is None
+    asyncio.run(run())

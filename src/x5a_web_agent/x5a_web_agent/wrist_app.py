@@ -46,7 +46,7 @@ bridge = None
 asr = create_asr(os.environ.get('X5A_ASR_BACKEND', 'sensevoice'))
 state = {'stage': 'IDLE', 'stage_zh': STAGE_ZH['IDLE'], 'busy': False,
          'prepared': False, 'holding': None, 'transcript': '', 'parsed': None,
-         'last_result': None, 'server_ready': False}
+         'last_result': None, 'server_ready': False, 'command_history': []}
 clients = set()
 observers = []
 _job = None
@@ -321,10 +321,18 @@ async def handle_text(text):
     if task.get('action') not in ('cancel', 'help', 'status'):
         snapshot = await refresh()
         task = parse_wrist_command(text, context=snapshot)
-    await update(transcript=text, parsed=task)
+    # Keep a bounded record of utterances and their own acceptance/rejection,
+    # separately from the previous robot execution result. Never retain audio.
+    history = state.get('command_history', [])
+    entry = {'number': history[-1]['number']+1 if history else 1,
+             'text': text, 'parsed': task}
+    await update(transcript=text, parsed=task, command_history=[*history, entry][-20:])
     await broadcast({'type': 'transcript', 'text': text})
     await broadcast({'type': 'parsed', 'result': task})
-    return await dispatch(task)
+    reply = await dispatch(task)
+    entry['reply'] = {key: reply[key] for key in ('ok', 'type', 'message') if key in reply}
+    await update(command_history=state.get('command_history', []))
+    return reply
 
 
 @app.get('/')

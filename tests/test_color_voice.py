@@ -140,3 +140,55 @@ def test_terminal_describes_every_resolved_color_step():
     from x5a_web_agent.task_sequence import describe_task
     task=parse_wrist_command('把白块放橙块上，然后再拿起来放红块上')
     assert describe_task(task) == '白块 → 橙块；然后 白块 → 红块'
+
+
+@pytest.mark.parametrize('pronoun', ['它','他','她','这个方块'])
+@pytest.mark.parametrize('connector', ['再把','然后把','接着把','再将'])
+def test_implicit_repick_after_placement(pronoun,connector):
+    text=f'把白色方块放到红色方块上，{connector}{pronoun}放到橙色方块上。'
+    assert parse_wrist_command(text) == {'action':'task_sequence','tasks':[
+        {'action':'pick_place','target_color':'white','destination_color':'red'},
+        {'action':'pick_place','target_color':'white','destination_color':'orange'}]}
+
+
+@pytest.mark.parametrize('tail', ['再放到橙色方块上','然后放到橙色方块上','接着放橙块上'])
+def test_omitted_subject_after_complete_placement(tail):
+    task=parse_wrist_command('先抓白块，然后放红块上，'+tail)
+    assert task == {'action':'task_sequence','tasks':[
+        {'action':'pick_place','target_color':'white','destination_color':'red'},
+        {'action':'pick_place','target_color':'white','destination_color':'orange'}]}
+
+
+@pytest.mark.parametrize('source,first,second', [('red','white','orange'),('orange','red','white')])
+def test_reference_uses_source_not_last_mentioned_support(source,first,second):
+    labels={'red':'红','white':'白','orange':'橙'}
+    text=f'把{labels[source]}块放{labels[first]}块上，再把它放{labels[second]}块上'
+    tasks=parse_wrist_command(text)['tasks']
+    assert [task['target_color'] for task in tasks] == [source,source]
+    assert [task['destination_color'] for task in tasks] == [first,second]
+
+
+@pytest.mark.parametrize('text', ['再把它放橙块上','然后把他放橙块上','接着放到橙块上'])
+def test_cross_utterance_continuation_requires_confirmed_source(text):
+    assert parse_wrist_command(text)['action'] == 'unknown'
+    context={'holding':False,'last_moved_color':'white','last_support_color':'red'}
+    assert parse_wrist_command(text,context) == {'action':'pick_place','target_color':'white','destination_color':'orange'}
+    assert parse_wrist_command(text,{'holding':True,'holding_color':'white'}) == {
+        'action':'place','source_color':'white','destination_color':'orange'}
+
+
+def test_plain_place_without_continuation_still_requires_current_holding():
+    context={'holding':False,'last_moved_color':'white','last_support_color':'red'}
+    assert parse_wrist_command('把它放橙块上',context) == {'action':'place','destination_color':'orange'}
+
+
+def test_repeated_implicit_placements_keep_the_same_cube():
+    task=parse_wrist_command('把白块放红块上，再把它放橙块上，然后放红块上')
+    assert task['action'] == 'task_sequence'
+    assert [(t['target_color'],t['destination_color']) for t in task['tasks']] == [
+        ('white','red'),('white','orange'),('white','red')]
+
+
+@pytest.mark.parametrize('tail', ['再把它放白块上','再把它放蓝块上','再把手里的方块放橙块上'])
+def test_impossible_or_invalid_implicit_tail_is_rejected_whole(tail):
+    assert parse_wrist_command('把白块放红块上，'+tail)['action'] == 'unknown'

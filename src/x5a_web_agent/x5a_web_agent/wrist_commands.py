@@ -138,6 +138,19 @@ def _held_context(task, context):
     return task
 
 
+def _referenced_task(subject, destination, support, index):
+    if subject not in COLORS:
+        raise ValueError(f'第 {index} 步缺少指代，请说出要再次抓取的颜色')
+    if subject == destination:
+        labels = {'red': '红', 'white': '白', 'orange': '橙'}
+        hint = (f'；你是指拿{labels[support]}块放到{labels[destination]}块上吗？'
+                if support in COLORS and support != destination else '')
+        raise ValueError(f'第 {index} 步默认指刚操作的{labels[subject]}块，不能放到自身上'+hint)
+    if destination == 'hold':
+        return {'action': 'pick', 'target_color': subject}
+    return {'action': 'pick_place', 'target_color': subject, 'destination_color': destination}
+
+
 def _parse_program(clauses, context):
     held = context.get('holding_color') if context.get('holding') else None
     subject = held or context.get('last_moved_color')
@@ -145,7 +158,8 @@ def _parse_program(clauses, context):
     tasks = []
     for index, clause in enumerate(clauses, 1):
         text = _normalize_spoken(clause)
-        text = re.sub(r'^(?:先|再)(?=把|将|抓|拿|夹|放)', '', text)
+        continuation = bool(re.match(r'^(?:再|然后|接着|随后|之后)', text))
+        text = re.sub(r'^(?:先|再|然后|接着|随后|之后)+(?=把|将|抓|拿|夹|放)', '', text)
         task = _parse_single(text)
         if task['action'] == 'unknown':
             # Explicit re-pick with an omitted object, e.g. 再拿起来放到红块上.
@@ -154,19 +168,19 @@ def _parse_program(clauses, context):
                 tail = match[1]
                 place = _parse_single(tail) if tail else {'action': 'pick'}
                 if place['action'] in ('place', 'pick'):
-                    if subject not in COLORS:
-                        raise ValueError(f'第 {index} 步“再拿起来”缺少指代，请说出颜色')
-                    destination = place.get('destination_color', 'hold')
-                    if subject == destination:
-                        label = {'red': '红', 'white': '白', 'orange': '橙'}
-                        hint = f'；你是指拿{label[support]}块放到{label[destination]}块上吗？' if support in COLORS and support != destination else ''
-                        raise ValueError(f'第 {index} 步默认指刚操作的{label[subject]}块，不能放到自身上'+hint)
-                    task = {'action': 'pick', 'target_color': subject} if destination == 'hold' else {
-                        'action': 'pick_place', 'target_color': subject, 'destination_color': destination}
+                    task = _referenced_task(subject, place.get('destination_color', 'hold'), support, index)
         if task['action'] == 'place' and tasks and tasks[-1]['action'] == 'pick':
             previous = tasks.pop()
             task = {'action': 'pick_place', 'target_color': previous['target_color'],
                     'destination_color': task['destination_color']}
+        elif (task['action'] == 'place' and tasks and tasks[-1]['action'] == 'pick_place'
+              and not any(word in text for word in ('手里的', '夹着的'))):
+            # A completed placement leaves the hand empty. “再把它放…” means
+            # re-pick the last manipulated cube, not the supporting cube.
+            task = _referenced_task(subject, task['destination_color'], support, index)
+        elif (task['action'] == 'place' and not tasks and held not in COLORS and continuation
+              and not any(word in text for word in ('手里的', '夹着的'))):
+            task = _referenced_task(subject, task['destination_color'], support, index)
         if task['action'] == 'place' and not tasks and held in COLORS:
             task = {'action': 'pick_place', 'target_color': held, 'destination_color': task['destination_color']}
         if task['action'] not in ('pick_place', 'pick', 'place'):

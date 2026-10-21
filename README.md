@@ -199,7 +199,7 @@ X5A_TEST_ROS_DOMAIN_ID=157 /usr/bin/python3 -m pytest -q \
   src/x5a_vision/test src/x5a_handeye/test --disable-warnings
 ```
 
-2026-10-20 颜色交互与连续抓放修复后的完整回归 **677 项通过**。`conftest.py` 从 `X5A_TEST_ROS_DOMAIN_ID` 设置测试域，仅设置 `ROS_DOMAIN_ID` 会被覆盖。保存场景回放、性能测量及实机验证边界见 [验证记录](docs/VALIDATION.md)。
+2026-10-21 颜色续接指令修复后的完整回归 **708 项通过**。`conftest.py` 从 `X5A_TEST_ROS_DOMAIN_ID` 设置测试域，仅设置 `ROS_DOMAIN_ID` 会被覆盖。保存场景回放、性能测量及实机验证边界见 [验证记录](docs/VALIDATION.md)。
 
 - 标定留出集最大误差约 4.7 mm，严格 3 mm 验收失败；棱角对齐尚无高精度实机堆叠保证。
 - SAM 持物点云尚未作为完整附着碰撞体覆盖所有运动阶段，其他物体的场景建模也不完整。完整轨迹不代表所有物体与环境接触都已验证。

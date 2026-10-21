@@ -237,7 +237,8 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
         for entry in self.scene_memory.snapshot():
             if color in (entry['upper'], entry['lower']):
                 self.scene_memory.observe(color, pose_to_xyz(pose.pose), self.base_frame,
-                    self.observation_side, stamp, self.vision_snapshot().get(entry['upper']))
+                    self.observation_side, stamp, self.vision_snapshot().get(entry['upper']),
+                    scene=self.vision_snapshot())
                 break
 
     def on_object_picked(self, color):
@@ -261,7 +262,7 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
         labels = {'no_top_face': '未识别到完整顶面；若被压住，请先移走上层方块',
                   'missing': '当前未检测到；摆回可见位置后可再次抓取',
                   'out_of_workspace': '当前方块超出抓取范围',
-                  'height_out_of_range': '当前方块高度超出两层范围'}
+                  'height_out_of_range': '当前方块高度超出三层范围'}
         for color in ALLOWED_COLORS:
             reason = self._detection_details.get(color)
             if not snapshot[color]['ready'] and reason in labels:
@@ -619,6 +620,17 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
             self._finish(ok)
         return result
 
+    def stack_destination_fault(self, destination, source=None):
+        if destination not in ALLOWED_COLORS:
+            return ''
+        blocker = self._resolve_blocker(destination)
+        if source is not None and blocker is not None and blocker == self._resolve_blocker(source):
+            return ''  # Clearing the requested source also uncovers this support.
+        if ((blocker is not None and blocker != source)
+                or (self.scene_memory.has_lower(destination) and blocker is None)):
+            return '放置目标上已有方块或支撑关系尚未确认，请先移开上层方块'
+        return ''
+
     def execute_color_step(self, color, destination):
         """An explicit name of the held cube means place, never regrasp it."""
         if self._holding:
@@ -629,10 +641,16 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
             if destination == 'hold':
                 return True, '当前已夹持指定方块，等待放置指令'
             return self.execute_held_placement(destination)
+        fault = self.stack_destination_fault(destination, source=color)
+        if fault:
+            return False, fault
         kwargs = ({'pick_only': True} if destination == 'hold' else
                   {'destination_color': destination} if destination != 'box' else {})
         ok, message = self.clear_target_if_needed(color)
-        return self.execute_pick_place(color, **kwargs) if ok else (False, message)
+        if not ok:
+            return False, message
+        fault = self.stack_destination_fault(destination, source=color)
+        return (False, fault) if fault else self.execute_pick_place(color, **kwargs)
 
     @staticmethod
     def sequence_tasks(request):
@@ -742,6 +760,9 @@ class WristTaskServer(ClearingMixin, PickPlaceNode):
             return False, '当前没有已定位夹持的方块，请先说“抓白色方块”等抓取指令'
         if destination == self._held_color:
             return False, '放置目标必须是盒子或另一种颜色的方块'
+        fault = self.stack_destination_fault(destination)
+        if fault:
+            return False, fault+'；夹持状态保留'
         self.report_stage('WAITING_VISION')
         target = self.wait_for_placement_target(destination)
         if target is None:

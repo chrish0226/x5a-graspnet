@@ -1,4 +1,4 @@
-"""Choose an observed table buffer for this task, clear one layer, then reobserve."""
+"""Choose an observed table buffer for this task, clear from the top, and reobserve each layer."""
 import json
 import math
 import time
@@ -14,13 +14,25 @@ from x5a_pick_place.stacking import tcp_for_object_center
 
 class ClearingMixin:
     def _resolve_blocker(self, color):
-        live = self._clearing_details().get('blocked_by', {}).get(color)
-        if live is not None:
-            return live
+        relations = self._clearing_details().get('blocked_by', {})
         memory = getattr(self, 'scene_memory', None)
-        if memory is None:
-            return None
-        return memory.candidate(color, self.vision_snapshot(), self.base_frame, self.observation_side)
+        snapshot = self.vision_snapshot() if memory is not None else None
+        def remembered(lower):
+            return (memory.candidate(lower, snapshot, self.base_frame, self.observation_side)
+                    if memory is not None else None)
+        blocker = relations.get(color) or remembered(color)
+        seen = {color}
+        for _ in range(2):
+            if blocker is None:
+                return None
+            if blocker in seen:
+                return None
+            seen.add(blocker)
+            higher = remembered(blocker) or relations.get(blocker)
+            if higher is None:
+                return blocker
+            blocker = higher
+        return None
 
     def _inside_buffer_table(self, xy):
         # Keep the complete observed 8 cm clearance patch on the modeled table.
@@ -216,7 +228,10 @@ class ClearingMixin:
         return reason or '暂放位尚未获得三帧连续的新深度确认'
 
     def clear_target_if_needed(self, color):
-        """Called within the existing ROS goal's ownership and cancellation scope."""
+        """Own one ROS goal; remove at most two upper cubes, from the top down."""
+        return self._clear_target_layers(color, remaining=2, cleared=())
+
+    def _clear_target_layers(self, color, remaining, cleared):
         blocker = self._resolve_blocker(color)
         memory = getattr(self, 'scene_memory', None)
         remembered = memory is not None and memory.has_lower(color)
@@ -241,6 +256,8 @@ class ClearingMixin:
             return True, ''
         if blocker not in self.allowed_colors or blocker == color:
             return False, '上层方块关系不明确，未开始移开'
+        if remaining <= 0 or blocker in cleared:
+            return False, '三层清障范围内未确认目标已露出，停止后续抓取'
         if self.plan_only:
             return False, '自动移开需要实际重新观察；仅规划模式不执行连续抓取'
         if self._holding:
@@ -291,11 +308,29 @@ class ClearingMixin:
             pose = self.cube_poses.get(color)
             exposure = (pose.header.stamp.sec*1_000_000_000+pose.header.stamp.nanosec) if pose else 0
             details = self._clearing_details(observed_after)
-            if item['ready'] and arrival > observed_after and details and exposure >= details['stamp_ns']:
+            next_blocker = self._resolve_blocker(color) if details else None
+            still_covered = ((memory is not None and memory.has_lower(color))
+                             or (next_blocker is not None and next_blocker not in (*cleared, blocker)))
+            if (item['ready'] and not still_covered and arrival > observed_after
+                    and details and exposure >= details['stamp_ns']):
                 xyz = item['xyz']
                 if (math.dist(xyz[:2], source_top[:2]) > .015
-                        or abs(xyz[2]-(self.table_z+.5*self.table_sz+self.obj_sz)) > .012):
+                        or abs(xyz[2]-(source_top[2]-self.obj_sz-self.stack_clearance)) > .012):
                     return False, '上层方块已移开，但目标位置与原叠放位置不一致，停止抓取'
                 return True, ''
+            # The requested bottom can remain hidden after removing the third
+            # layer. Require a new exposure of the next blocker before recursion.
+            if next_blocker in self.allowed_colors and next_blocker not in (*cleared, blocker):
+                next_item = self.vision_snapshot()[next_blocker]
+                next_pose = self.cube_poses.get(next_blocker)
+                next_stamp = (next_pose.header.stamp.sec*1_000_000_000+next_pose.header.stamp.nanosec) if next_pose else 0
+                if (next_item['ready'] and next_item.get('xyz') is not None
+                        and self.cube_pose_arrivals.get(next_blocker, 0.) > observed_after
+                        and next_stamp >= details['stamp_ns']):
+                    xyz = next_item['xyz']
+                    if (math.dist(xyz[:2], source_top[:2]) > .015
+                            or abs(xyz[2]-(source_top[2]-self.obj_sz-self.stack_clearance)) > .012):
+                        return False, '下一层方块的位置或高度与原叠放关系不一致，停止清障'
+                    return self._clear_target_layers(color, remaining-1, (*cleared, blocker))
             time.sleep(.05)
         return False, '上层方块已移到暂放位，但目标未获得新的稳定顶面定位；请检查后重试'

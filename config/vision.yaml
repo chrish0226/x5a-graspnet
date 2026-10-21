@@ -70,7 +70,7 @@
       close_iterations: 2
       inner_erode_px: 11
       top_face_mode: base_plane
-      max_cube_layers: 2
+      max_cube_layers: 3
       face_size_tolerance_m: 0.012
       max_rgbd_gap_s: 0.04
     depth:
@@ -93,7 +93,7 @@
       y_max: 0.58
       r_max: 0.65
       z_min: -0.015
-      z_max: 0.08
+      z_max: 0.11
       expected_x: 0.2
       expected_y: 0.33
     filter:

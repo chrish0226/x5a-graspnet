@@ -1421,7 +1421,7 @@ def test_program_rejects_invalid_tail_before_any_motion(robot,monkeypatch):
     robot._prepared=True
     motion=Mock(side_effect=AssertionError('no motion on invalid tail'))
     monkeypatch.setattr(robot,'execute_color_step',motion)
-    for request in [program_goal(('white','red'),('orange','white')),
+    for request in [program_goal(('white','red'),('orange','orange')),
                     program_goal(('white','white'),('orange','white')),
                     program_goal(('white',),('orange',)), program_goal(('white','red'),('box',))]:
         assert robot.sequence_goal_callback(request) == GoalResponse.REJECT
@@ -1581,3 +1581,65 @@ def test_recent_utterances_are_bounded_and_never_store_audio(monkeypatch):
         assert all(set(entry)=={'number','text','parsed','reply'} for entry in history)
         assert fake.calls == [] and web._job is None
     asyncio.run(run())
+
+
+def test_held_third_layer_placement_keeps_base_pair_and_records_new_top(robot,monkeypatch):
+    calls,_=split_flow_hardware(robot,monkeypatch)
+    known_held_white(robot);robot._held_color='red'
+    white=PoseStamped();white.pose.position.x=.30;white.pose.position.y=.30;white.pose.position.z=.056;white.pose.orientation.w=1.
+    robot.cube_poses['white']=white;robot.cube_stable['white']=True;robot.cube_pose_arrivals['white']=time.monotonic()
+    robot.scene_memory.record_stack('white','orange',(.30,.30,.041),.03,.002,robot.base_frame,'current',1)
+    assert robot.execute_held_placement('white')[0]
+    memory=robot.scene_memory.snapshot()
+    assert {(r['upper'],r['lower']) for r in memory}=={('white','orange'),('red','white')}
+    new=next(r for r in memory if r['upper']=='red')
+    assert new['lower_top']==pytest.approx([.30,.30,.056])
+    assert new['upper_top']==pytest.approx([.30,.30,.088])
+    assert not robot._holding
+    assert [c for c in calls if c[0]=='gripper']==[('gripper',True)]
+
+
+def test_complete_third_layer_grab_and_place_uses_second_layer_surface(robot,monkeypatch):
+    split_flow_hardware(robot,monkeypatch)
+    red=PoseStamped();red.pose.position.x=.30;red.pose.position.y=.30;red.pose.position.z=.056;red.pose.orientation.w=1.
+    robot.cube_poses['red']=red;robot.cube_stable['red']=True;robot.cube_pose_arrivals['red']=time.monotonic()
+    robot.scene_memory.record_stack('red','orange',(.30,.30,.041),.03,.002,robot.base_frame,'current',1)
+    assert robot.execute_pick_place('white',destination_color='red')[0]
+    records=robot.scene_memory.snapshot()
+    assert {(r['upper'],r['lower']) for r in records}=={('red','orange'),('white','red')}
+    assert next(r for r in records if r['upper']=='white')['upper_top'][2]==pytest.approx(.088)
+
+
+def test_fourth_layer_rejected_before_release_and_holding_preserved(robot,monkeypatch):
+    known_held_white(robot)
+    red=PoseStamped();red.pose.position.x=.30;red.pose.position.y=.30;red.pose.position.z=.088;red.pose.orientation.w=1.
+    robot.cube_poses['red']=red;robot.cube_stable['red']=True;robot.cube_pose_arrivals['red']=time.monotonic()
+    monkeypatch.setattr(robot,'call_gripper',Mock(side_effect=AssertionError('must not release on a fourth layer')))
+    response=robot.place_callback(Trigger.Request(),Trigger.Response(),'red')
+    assert not response.success and robot._holding and robot._held_color=='white'
+    robot.call_gripper.assert_not_called()
+
+
+def test_known_occupied_destination_blocks_placement_without_moving_or_releasing(robot,monkeypatch):
+    known_held_white(robot);robot._held_color='red'
+    robot.scene_memory.record_stack('white','orange',(.30,.30,.041),.03,.002,robot.base_frame,'current',1)
+    monkeypatch.setattr(robot,'wait_for_placement_target',Mock(side_effect=AssertionError('known occupied target')))
+    assert not robot.execute_held_placement('orange')[0]
+    assert not robot.execute_color_step('white','orange')[0]
+    assert robot._holding and robot._held_color=='red'
+
+
+def test_three_layer_program_accepts_and_keeps_one_action_owner(robot,monkeypatch):
+    robot._prepared=True;calls=[]
+    def execute(source,destination):
+        assert robot._busy
+        calls.append((source,destination))
+        return True,''
+    monkeypatch.setattr(robot,'execute_color_step',execute)
+    monkeypatch.setattr(robot,'_wait_observation',lambda **kw:True)
+    request=program_goal(('white','red'),('orange','white'))
+    assert robot.sequence_goal_callback(request)==GoalResponse.ACCEPT
+    h=handle(request);h.publish_feedback=Mock()
+    result=robot.sequence_execute_callback(h)
+    assert result.success and result.completed_steps==2
+    assert calls==[('white','orange'),('red','white')]

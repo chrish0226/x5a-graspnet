@@ -1,4 +1,4 @@
-"""Conservative two-layer support and fixed-buffer checks on live RGB-D points."""
+"""Conservative three-layer support and fixed-buffer checks on live RGB-D points."""
 from pathlib import Path
 import math
 
@@ -136,22 +136,30 @@ def base_cloud(depth, intrinsics, transform, depth_min, depth_max, stride=3):
     return camera @ t[:3, :3].T + t[:3, 3], xs, ys
 
 
-def blockers_from_sides(points, pixel_colors, visible_tops, unavailable, table_top, size=.03):
-    """Require colored side depth under one stable second-layer top.
+def blockers_from_sides(points, pixel_colors, visible_tops, unavailable, table_top, size=.03, max_layers=3):
+    """Identify a removable visible top above current colored lower side depth.
 
-    Old hidden target poses are never used. Ambiguous towers produce no relation.
+    A relation names the exposed blocker, which may be two layers above the
+    target. It never invents a pose for a hidden intermediate cube.
     """
     result = {}
     for lower in unavailable:
         side = points[pixel_colors == lower]
         candidates = []
         for upper, top in visible_tops.items():
-            if upper == lower or abs(top[2]-(table_top+2*size)) > .012:
+            if upper == lower:
                 continue
-            near = side[(np.max(np.abs(side[:, :2]-top[:2]), axis=1) <= size*.5+.006)
-                        & (side[:, 2] >= table_top+.004) & (side[:, 2] <= table_top+size-.003)]
-            if len(near) >= 20 and np.ptp(near[:, 2]) >= .006:
-                candidates.append(upper)
+            layers = [layer for layer in range(2, max_layers+1)
+                      if abs(top[2]-(table_top+layer*size)) <= .012]
+            if len(layers) != 1:
+                continue
+            under = side[np.max(np.abs(side[:, :2]-top[:2]), axis=1) <= size*.5+.006]
+            for layer in range(1, layers[0]):
+                near = under[(under[:, 2] >= table_top+(layer-1)*size+.004)
+                             & (under[:, 2] <= table_top+layer*size-.003)]
+                if len(near) >= 20 and np.ptp(near[:, 2]) >= .006:
+                    candidates.append(upper)
+                    break
         if len(candidates) == 1:
             result[lower] = candidates[0]
     return result

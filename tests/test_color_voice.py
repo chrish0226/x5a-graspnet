@@ -42,7 +42,7 @@ def test_spoken_batches_keep_order(text, colours):
 @pytest.mark.parametrize('text', ['先抓红块然后放到红色方块上','按红红白顺序放进盒子',
     '抓蓝色小方块','把红色方块放到白色方块旁边','三个方块叠起来',
     '先抓红块然后抓白块','把红块放进盒子然后', '准备然后抓红色',
-    '抓红白橙', '把白色放橙色上然后把红色放白色上', '把红白三个方块都放进盒子'])
+    '抓红白橙', '把红白三个方块都放进盒子'])
 def test_ambiguous_or_unsupported_requests_do_not_partially_execute(text):
     assert parse_wrist_command(text)['action'] == 'unknown'
 
@@ -130,7 +130,7 @@ def test_explicit_swap_uses_existing_clearing_instead_of_rejecting_repeat_colors
 
 @pytest.mark.parametrize('text', ['把白块放到橙块上，然后把它拿起来放到蓝块上',
     '把白块放到橙块上，然后转一下', '把白块放到橙块上，然后再拿起来放到白块上',
-    '把白块放到橙块上，然后把红块放到白块上'])
+    '把白块放到橙块上，然后把红块放到橙块上'])
 def test_invalid_later_step_rejects_entire_program(text):
     assert parse_wrist_command(text)['action'] == 'unknown'
 
@@ -192,3 +192,11 @@ def test_repeated_implicit_placements_keep_the_same_cube():
 @pytest.mark.parametrize('tail', ['再把它放白块上','再把它放蓝块上','再把手里的方块放橙块上'])
 def test_impossible_or_invalid_implicit_tail_is_rejected_whole(tail):
     assert parse_wrist_command('把白块放红块上，'+tail)['action'] == 'unknown'
+
+
+@pytest.mark.parametrize('text', ['把白块放橙块上，然后把红块放白块上',
+    '把白色放橙色上然后把红色放白色上', '先抓白块，然后放橙块上，再抓红块，然后放白块上'])
+def test_explicit_three_layer_program(text):
+    assert parse_wrist_command(text) == {'action':'task_sequence','tasks':[
+        {'action':'pick_place','target_color':'white','destination_color':'orange'},
+        {'action':'pick_place','target_color':'red','destination_color':'white'}]}

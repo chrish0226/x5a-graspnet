@@ -89,6 +89,8 @@ class Session(ClearingMixin):
     def execute_pick_place(self, color, **kwargs):
         self.calls.append(('pick',color,kwargs))
         self._holding = self.pick_ok
+        if self.pick_ok and hasattr(self,'scene_memory'):
+            self.scene_memory.moved(color)
         return self.pick_ok, 'pick failed'
     def execute_place_motion(self, *args):
         self.calls.append(('place',args))
@@ -335,3 +337,124 @@ def test_freeze_rechecks_latest_frame_and_catches_occupation_during_handoff():
     assert not robot._freeze_buffer_precheck((.28,.30))
     clear['selected_buffer']['empty']=False
     assert not robot._freeze_buffer_precheck((.28,.30))
+
+
+class TripleSession(Session):
+    def __init__(self):
+        super().__init__()
+        self.tower=['orange','white','red']
+        self.removed=[]
+        self._held_color=None
+        self.fail_second_place=False
+        self.fresh_next=True
+        self.next_shift=0.
+        self.cancel_after_first=False
+        self.cube_poses={}
+        self.cube_pose_arrivals={}
+        self._expose()
+    def _expose(self):
+        color=self.tower[-1]
+        self.cube_poses[color]=SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace(sec=0,nanosec=100+len(self.removed))))
+        self.cube_pose_arrivals[color]=time.monotonic()+1 if self.fresh_next else 0.
+    def _clearing_details(self,after=0.):
+        return {'blocked_by':{color:self.tower[-1] for color in self.tower[:-1]},'stamp_ns':100+len(self.removed)}
+    def vision_snapshot(self):
+        result={color:{'ready':False,'status':'no_top_face','xyz':None} for color in self.allowed_colors}
+        top=self.tower[-1]
+        result[top]={'ready':True,'status':'stable','xyz':[.36+self.next_shift*(bool(self.removed)),.30,.024+.032*(len(self.tower)-1)]}
+        for index,color in enumerate(self.removed):
+            result[color]={'ready':True,'status':'stable','xyz':[.20,.30+index*.10,.026]}
+        return result
+    def execute_pick_place(self,color,**kwargs):
+        self.calls.append(('pick',color,kwargs))
+        assert color==self.tower[-1]
+        self._holding=True;self._held_color=color
+        if hasattr(self,'scene_memory'): self.scene_memory.moved(color)
+        return True,''
+    def execute_place_motion(self,*args):
+        self.calls.append(('place',args))
+        if self.fail_second_place and self.removed:return False,'规划失败'
+        self.removed.append(self.tower.pop());self._holding=False
+        self._expose()
+        if self.cancel_after_first:self.canceled=True
+        return True,''
+
+
+def test_clear_three_layer_bottom_removes_top_then_middle_with_new_observations():
+    robot=TripleSession()
+    assert robot.clear_target_if_needed('orange')[0]
+    assert [c[1] for c in robot.calls if isinstance(c,tuple) and c[0]=='pick']==['red','white']
+    assert robot.tower==['orange'] and not robot._holding
+    assert robot.calls.count('REOBSERVE_UNCOVERED')==2
+    assert robot.calls.count('observation')==2
+
+
+def test_clear_middle_of_three_layer_tower_leaves_middle_on_its_support():
+    robot=TripleSession()
+    assert robot.clear_target_if_needed('white')[0]
+    assert robot.removed==['red'] and robot.tower==['orange','white']
+
+
+@pytest.mark.parametrize('case',['stale_next','shifted_next','cancel','second_place_failure'])
+def test_three_layer_clearing_stops_on_changed_evidence_or_failure(case):
+    robot=TripleSession()
+    if case=='stale_next':robot.fresh_next=False
+    if case=='shifted_next':robot.next_shift=.04
+    if case=='cancel':robot.cancel_after_first=True
+    if case=='second_place_failure':robot.fail_second_place=True
+    assert not robot.clear_target_if_needed('orange')[0]
+    picks=[c[1] for c in robot.calls if isinstance(c,tuple) and c[0]=='pick']
+    assert picks==(['red','white'] if case=='second_place_failure' else ['red'])
+    assert robot.removed==['red']
+    assert robot._holding == (case=='second_place_failure')
+
+
+def test_three_layer_clearing_can_use_hidden_lower_memory_without_side_colors():
+    from x5a_task_server.scene_memory import SceneMemory
+    robot=TripleSession();robot.base_frame='base';robot.observation_side='current'
+    robot.scene_memory=SceneMemory()
+    robot.scene_memory.record_stack('white','orange',(.36,.30,.041),.03,.002,'base','current',1)
+    robot.scene_memory.record_stack('red','white',(.36,.30,.073),.03,.002,'base','current',2)
+    robot._clearing_details=lambda after=0.:{'blocked_by':{},'stamp_ns':100+len(robot.removed)}
+    assert robot.clear_target_if_needed('orange')[0]
+    assert robot.removed==['red','white'] and not robot.scene_memory.snapshot()
+
+
+def test_live_side_depth_resolves_third_layer_blocker_without_guessing_middle_pose():
+    bottom=np.column_stack((np.full(80,.345),np.linspace(.29,.31,80),np.linspace(.0,.02,80)))
+    middle=bottom.copy();middle[:,2]+=.032
+    points=np.vstack([bottom,middle]);colors=np.array(['orange']*80+['white']*80)
+    tops={'red':np.array([.36,.30,.088])}
+    assert blockers_from_sides(points,colors,tops,['orange','white'],-.006)=={'orange':'red','white':'red'}
+    assert not blockers_from_sides(points,colors,tops,['orange','white'],-.006,max_layers=2)
+
+
+def test_bottom_restack_can_clear_a_destination_in_the_same_tower():
+    from x5a_task_server.wrist_task_server import WristTaskServer
+    from x5a_task_server.scene_memory import SceneMemory
+    robot=TripleSession();robot.base_frame='base';robot.observation_side='current'
+    robot.scene_memory=SceneMemory()
+    robot.scene_memory.record_stack('white','orange',(.36,.30,.041),.03,.002,'base','current',1)
+    robot.scene_memory.record_stack('red','white',(.36,.30,.073),.03,.002,'base','current',2)
+    robot.stack_destination_fault=lambda destination,source=None:WristTaskServer.stack_destination_fault(robot,destination,source)
+    assert WristTaskServer.execute_color_step(robot,'orange','white')[0]
+    assert [c[1] for c in robot.calls if isinstance(c,tuple) and c[0]=='pick']==['red','white','orange']
+    assert robot.calls[-1][2]=={'destination_color':'white'}
+
+
+def test_visible_bottom_fragment_cannot_skip_the_still_covered_middle_layer():
+    from x5a_task_server.scene_memory import SceneMemory
+    robot=TripleSession();robot.base_frame='base';robot.observation_side='current'
+    robot.scene_memory=SceneMemory()
+    robot.scene_memory.record_stack('white','orange',(.36,.30,.041),.03,.002,'base','current',1)
+    robot.scene_memory.record_stack('red','white',(.36,.30,.073),.03,.002,'base','current',2)
+    original=robot.vision_snapshot
+    def partial_bottom():
+        result=original()
+        result['orange']={'ready':True,'status':'stable','xyz':[.36,.30,.024]}
+        robot.cube_pose_arrivals['orange']=time.monotonic()+1
+        robot.cube_poses['orange']=SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace(sec=0,nanosec=100+len(robot.removed))))
+        return result
+    robot.vision_snapshot=partial_bottom
+    assert robot.clear_target_if_needed('orange')[0]
+    assert robot.removed==['red','white']

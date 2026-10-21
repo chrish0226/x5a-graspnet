@@ -50,3 +50,17 @@ def test_two_layer_cube_top_height_gate():
     assert CubeDetector.valid_cube_top(detector, .024)
     assert CubeDetector.valid_cube_top(detector, .054)
     assert not CubeDetector.valid_cube_top(detector, .085)
+
+
+def test_three_layer_height_gate_and_workspace_config():
+    from pathlib import Path
+    from types import SimpleNamespace
+    import yaml
+    from x5a_vision.cube_detector import CubeDetector
+    config=yaml.safe_load((Path(__file__).resolve().parents[3]/'config/vision.yaml').read_text())['/**']['ros__parameters']
+    detector=SimpleNamespace(table_z=config['table']['z'],object_height=config['object']['size_z'],
+        table_tol=config['table']['top_tolerance'],max_cube_layers=config['detection']['max_cube_layers'])
+    assert detector.max_cube_layers == 3
+    for z in (.024,.056,.084,.088): assert CubeDetector.valid_cube_top(detector,z)
+    assert not CubeDetector.valid_cube_top(detector,.118)
+    assert config['workspace']['z_max'] >= detector.table_z+3*detector.object_height+detector.table_tol

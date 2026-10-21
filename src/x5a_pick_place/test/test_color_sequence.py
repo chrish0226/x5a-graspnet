@@ -20,7 +20,6 @@ def test_hand_transitions_and_bound_queue():
 
 @pytest.mark.parametrize('tasks,held', [([],None),([step('white','box')]*9,None),
     ([step('white','white')],None),([step('white','orange')],'red'),
-    ([step('white','orange'),step('red','white')],None),
     ([step('white','orange'),step('red','orange')],None),
     ([{'action':'pick','target_color':'red'},step('white','orange')],None),
     ([{'action':'place','destination_color':'red'}],None),
@@ -28,3 +27,8 @@ def test_hand_transitions_and_bound_queue():
 def test_invalid_whole_program(tasks,held):
     with pytest.raises(ValueError):
         color_step_pairs(tasks,held)
+
+
+def test_build_three_layers_then_take_the_bottom_and_rebuild():
+    tasks=[step('white','orange'),step('red','white'),step('orange','white'),step('red','orange')]
+    assert color_step_pairs(tasks) == [('white','orange'),('red','white'),('orange','white'),('red','orange')]

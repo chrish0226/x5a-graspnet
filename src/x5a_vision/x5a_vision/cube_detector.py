@@ -267,8 +267,8 @@ class CubeDetector(Node):
         self.near_percentile = float(g("depth.near_percentile"))
         self.object_height = float(g("object.size_z"))
         self.max_cube_layers = int(g('detection.max_cube_layers'))
-        if not 1 <= self.max_cube_layers <= 2:
-            raise ValueError('only one or two cube layers are supported')
+        if not 1 <= self.max_cube_layers <= 3:
+            raise ValueError('one to three cube layers are supported')
         self.cube_miss_grace = float(g('filter.miss_grace_s'))
         self.table_z = float(g("table.z"))
         self.table_tol = float(g("table.top_tolerance"))
@@ -934,7 +934,7 @@ class CubeDetector(Node):
                 pixel_colors[color_masks[name][ys, xs] != 0] = name
             relations = blockers_from_sides(points, pixel_colors, visible_tops,
                 [name for name in COLORS if details[name] == 'no_top_face'],
-                self.table_z, self.object_height)
+                self.table_z, self.object_height, max_layers=self.max_cube_layers)
             confirmed = {}
             for name in COLORS:
                 self.cover_history[name].append(relations.get(name))
@@ -949,7 +949,7 @@ class CubeDetector(Node):
                 clearing['mode'] = mode
                 if mode == 'auto':
                     upper_tops = {color: top for color, top in visible_tops.items()
-                                  if abs(top[2]-(self.table_z+2*self.object_height)) <= self.table_tol}
+                                  if top[2] > self.table_z+1.5*self.object_height and self.valid_cube_top(top[2])}
                     surface_index = BufferSurfaceIndex(points, self.table_z, self.bounds) if upper_tops else None
                     clearing['buffer_search'] = {color: {} for color in upper_tops}
                     clearing['buffer_candidates'] = {color: buffer_candidates(points, top[:2],

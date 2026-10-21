@@ -1,4 +1,6 @@
 """Validate an entire colour programme before its first robot operation."""
+from x5a_pick_place.stacking import MAX_STACK_LAYERS
+
 COLORS = ('red', 'white', 'orange')
 MAX_COLOR_STEPS = 8
 
@@ -27,12 +29,21 @@ def color_step_pairs(tasks, held_color=None):
             raise ValueError(f'第 {index} 步没有可放置的持物')
         # Picking a known lower block invokes the existing clearing routine.
         # Its upper block is moved to an observed buffer before the pick.
-        for upper, lower in list(support.items()):
-            if lower == source:
-                support[upper] = None
-        support[source] = None
-        if destination in COLORS and support.get(destination) is not None:
-            raise ValueError(f'第 {index} 步会形成三层叠塔；当前颜色流程仅支持两层')
+        uncovered = {source}
+        for _ in range(MAX_STACK_LAYERS-1):
+            uncovered.update(upper for upper, lower in support.items() if lower in uncovered)
+        for upper in uncovered:
+            support[upper] = None
+        if destination in COLORS:
+            layer, below, visited = 2, support.get(destination), {destination}
+            while below is not None:
+                if below in visited:
+                    raise ValueError(f'第 {index} 步的叠放关系形成循环')
+                visited.add(below)
+                layer += 1
+                below = support.get(below)
+            if layer > MAX_STACK_LAYERS:
+                raise ValueError(f'第 {index} 步超过最多 {MAX_STACK_LAYERS} 层叠放')
         if destination in COLORS and destination in support.values():
             raise ValueError(f'第 {index} 步的支撑方块上已有方块，请先移开上层方块')
         support[source] = destination if destination in COLORS else None
